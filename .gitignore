@@ -40,3 +40,4 @@ models_cache/
 *.joblib
 *.pkl
 uploads/
+.gstack/
