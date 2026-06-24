@@ -246,6 +246,63 @@ async def list_documents(client_id: str) -> list[dict[str, Any]]:
             "ORDER BY created_at DESC", client_id)]
 
 
+async def get_document(client_id: str, doc_id: str) -> dict[str, Any] | None:
+    s = _schema()
+    async with acquire(client_id) as conn:
+        row = await conn.fetchrow(
+            f'SELECT * FROM "{s}".di_documents WHERE client_id = $1 AND id = $2 '
+            "AND deleted_at IS NULL", client_id, doc_id)
+        return dict(row) if row else None
+
+
+async def fetch_merged_facts(client_id: str, *, attribute_key: str | None = None,
+                             ) -> list[dict[str, Any]]:
+    s = _schema()
+    sql = f'SELECT * FROM "{s}".client_merged_fact WHERE client_id = $1'
+    params: list[Any] = [client_id]
+    if attribute_key:
+        params.append(attribute_key)
+        sql += f" AND attribute_key = ${len(params)}"
+    sql += " ORDER BY attribute_key"
+    async with acquire(client_id) as conn:
+        return [dict(r) for r in await conn.fetch(sql, *params)]
+
+
+async def fetch_areps(client_id: str, *, doc_id: str | None = None, knode_id: str | None = None,
+                      current_only: bool = True) -> list[dict[str, Any]]:
+    s = _schema()
+    conds = ["a.client_id = $1"]
+    params: list[Any] = [client_id]
+    if doc_id:
+        params.append(doc_id)
+        conds.append(f"a.doc_id = ${len(params)}")
+    if knode_id:
+        params.append(knode_id)
+        conds.append(f"a.knode_id = ${len(params)}")
+    if current_only:
+        conds.append("a.version_id IN (SELECT id FROM \"" + s + "\".doc_version dv "
+                     "WHERE dv.client_id = a.client_id AND dv.is_current)")
+    sql = f'SELECT * FROM "{s}".arep a WHERE ' + " AND ".join(conds)
+    async with acquire(client_id) as conn:
+        return [dict(r) for r in await conn.fetch(sql, *params)]
+
+
+async def list_version_changes(client_id: str, *, since: str | None = None,
+                               ) -> list[dict[str, Any]]:
+    """Version delta feed: versions (optionally created since a timestamp) + changed_fields."""
+    s = _schema()
+    sql = (f'SELECT v.*, d.document_name, d.doc_type FROM "{s}".doc_version v '
+           f'JOIN "{s}".di_documents d ON d.id = v.doc_id AND d.client_id = v.client_id '
+           "WHERE v.client_id = $1")
+    params: list[Any] = [client_id]
+    if since:
+        params.append(since)
+        sql += f" AND v.created_at >= ${len(params)}::timestamptz"
+    sql += " ORDER BY v.created_at DESC"
+    async with acquire(client_id) as conn:
+        return [dict(r) for r in await conn.fetch(sql, *params)]
+
+
 async def record_decision_trace(client_id: str, doc_id: str | None, gate: GateResult) -> None:
     s = _schema()
     async with acquire(client_id) as conn:

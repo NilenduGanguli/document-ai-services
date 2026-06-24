@@ -10,6 +10,7 @@ readme = "README.md"
 dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
+    "python-multipart>=0.0.9",   # FastAPI multipart (file uploads on /ingest)
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
     "asyncpg>=0.29",
