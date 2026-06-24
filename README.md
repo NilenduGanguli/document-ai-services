@@ -39,12 +39,22 @@ The app applies migrations on startup and — because the compose DB ships pgvec
 pgvector, so a bare `pytest`/uvicorn run degrades to FTS-only search). Point at the real model
 gateway by setting `RETRIEVAL_BASE_URL` and `DI_RETRIEVAL_STUB=false` in `docker-compose.yml`.
 
-**Supported input formats** (offline, no Azure key): **PDF** (digital → pypdf text layer; scanned →
-Tesseract via poppler), **DOCX** (python-docx), **PNG/JPEG** (Tesseract OCR), and plain text. In
-production, Azure AI Vision Read handles PDF/images instead (set `AZURE_VISION_*`); Tesseract image
-OCR is lossy (e.g. 0→O), so prefer Azure for images. Generate real fixtures with
+**Supported input formats:** **PDF** (digital → pypdf text layer; scanned → OCR), **DOCX**
+(python-docx), **PNG/JPEG** (OCR), and plain text. Generate real fixtures with
 `python tools/make_samples.py` → `samples/generated/{passport.pdf, ssn_card.docx,
 ine_credencial.png, utility_bill.jpg}`.
+
+**Image / scanned-PDF OCR — Azure Computer Vision Read v3.2.** The app talks to the Azure Read v3.2
+REST API directly over `httpx` (`di/ocr/vision.py`) — **no Azure SDK in any image**. The compose
+stack ships a **mock Azure OCR container** (`mock_azure_ocr/`, plain Python + Tesseract, no SDK)
+that serves the *same* v3.2 contract (`POST /vision/v3.2/read/analyze` → `Operation-Location` →
+`GET …/analyzeResults/{id}`), so the Azure code path runs end-to-end **offline** — images report
+`engine: azure-vision-read`. Point at **real Azure** by overriding the env (no code change):
+```bash
+AZURE_VISION_ENDPOINT=https://<resource>.cognitiveservices.azure.com/ \
+AZURE_VISION_KEY=<key> docker compose up -d app
+```
+If `AZURE_VISION_*` is unset entirely, OCR falls back to local Tesseract.
 
 **Exercise every flow + generate a report:**
 ```bash

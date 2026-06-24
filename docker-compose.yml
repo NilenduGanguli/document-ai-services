@@ -34,6 +34,11 @@ services:
       DI_RETRIEVAL_STUB: "true"     # offline model gateway; set false + RETRIEVAL_BASE_URL for real
       RETRIEVAL_BASE_URL: ""        # e.g. http://host.docker.internal:8000 once its gateway is deployed
       RETRIEVAL_API_KEY: ""
+      # Azure OCR (Computer Vision Read v3.2). Defaults to the local mock so the Azure code path is
+      # exercised offline; override with your real resource: AZURE_VISION_ENDPOINT=https://<res>.
+      # cognitiveservices.azure.com/ AZURE_VISION_KEY=<key> docker compose up -d app
+      AZURE_VISION_ENDPOINT: ${AZURE_VISION_ENDPOINT:-http://azure-ocr-mock:5000}
+      AZURE_VISION_KEY: ${AZURE_VISION_KEY:-mock-key}
       EMBEDDING_DIM_DEFAULT: "768"
       AREP_ASYNC: "false"           # generate accessibility reps synchronously for the demo
       DI_LOG_LEVEL: INFO
@@ -46,6 +51,20 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      azure-ocr-mock:
+        condition: service_healthy
+
+  # Mock Azure OCR (Computer Vision Read v3.2) — plain Python + Tesseract, no Azure SDK.
+  # Lets the app's Azure v3.2 HTTP client run end-to-end locally without a real Azure resource.
+  azure-ocr-mock:
+    build: ./mock_azure_ocr
+    ports:
+      - "5005:5000"          # host 5005 (macOS AirPlay squats on 5000); app uses the internal :5000
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\""]
+      interval: 3s
+      timeout: 3s
+      retries: 20
 
 volumes:
   pgdata: {}

@@ -38,6 +38,15 @@ ENGINE_TEXT = "text"
 ENGINE_NONE = "none"
 
 
+def _safe(fn):
+    """Call ``fn`` returning its result, or ``None`` on any exception (OCR must never raise)."""
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001 - degrade gracefully
+        logger.exception("OCR call failed; degrading")
+        return None
+
+
 def extract_pages(
     content: bytes,
     *,
@@ -58,122 +67,125 @@ def extract_pages(
         empty ``"none"`` result.
     """
     if not content:
-        return OcrResult(engine=ENGINE_NONE, pages=0, text="", lines=[])
+        return _empty()
 
     settings = get_settings()
-    if settings.has_azure_vision:
-        try:
-            result = _azure_read(content, filename=filename, mime=mime)
-            if result is not None:
-                return result
-        except Exception:  # never propagate; fall back below
-            logger.exception("Azure Vision Read OCR failed; falling back")
+    azure = settings.has_azure_vision
+    kind = _detect_kind(content, filename, mime)
 
-    return _fallback(content, filename=filename, mime=mime)
+    if kind == "image":
+        if azure:
+            r = _safe(lambda: _azure_read(content, filename=filename, mime=mime))
+            if r is not None:
+                return r
+        return _image_ocr(content) or _empty()
+    if kind == "pdf":
+        digital = _pypdf_text_layer(content)  # selectable text layer
+        if digital is not None:
+            return digital
+        # scanned PDF: rasterize, OCR each page with Azure (if configured) else Tesseract
+        page_ocr = (lambda b: _safe(lambda: _azure_read(b))) if azure else _image_ocr
+        return _pdf_ocr(content, page_ocr=page_ocr) or _empty()
+    if kind == "docx":
+        return _docx_extract(content) or _empty()
+    if kind == "text":
+        return _text_passthrough(content, mime=mime) or _empty()
+    # unknown: try text, then Azure (if configured), then Tesseract
+    text_result = _text_passthrough(content, mime=mime)
+    if text_result is not None:
+        return text_result
+    if azure:
+        r = _safe(lambda: _azure_read(content))
+        if r is not None:
+            return r
+    return _image_ocr(content) or _empty()
 
 
 # ---------------------------------------------------------------------------
-# Azure AI Vision Read
+# Azure OCR — Computer Vision Read v3.2 REST API (no SDK; plain httpx).
+# Speaks the v3.2 contract, so it works unchanged against real Azure
+# (https://<resource>.cognitiveservices.azure.com/) or the local mock container.
 # ---------------------------------------------------------------------------
-def _azure_read(
-    content: bytes,
-    *,
-    filename: str,
-    mime: str | None,
-) -> OcrResult | None:
-    """Run Azure AI Vision Read OCR. Lazy-imports the SDK; returns ``None`` if unavailable.
+def _azure_read(content: bytes, *, filename: str = "", mime: str | None = None) -> OcrResult | None:
+    """Call the Azure Computer Vision **Read v3.2** REST API and map the result.
 
-    Uses the modern ``azure-ai-vision-imageanalysis`` client with ``VisualFeatures.READ``.
-    Image-first: a PDF would be rasterized/handled by the async Read op upstream; this
-    synchronous path expects image bytes (or a single rendered page).
+    Async pattern: POST bytes to ``/vision/v3.2/read/analyze`` (→ 202 + ``Operation-Location``),
+    then poll ``GET <Operation-Location>`` until ``status`` is ``succeeded``/``failed``. Uses
+    ``httpx`` only — no Azure SDK. Returns ``None`` on any error so the caller can fall back.
     """
+    import time
+
+    import httpx
+
+    settings = get_settings()
+    base = settings.azure_vision_endpoint.rstrip("/")
+    key = settings.azure_vision_key
+    analyze_url = f"{base}/vision/v3.2/read/analyze"
+    auth = {"Ocp-Apim-Subscription-Key": key}
     try:
-        from azure.ai.vision.imageanalysis import ImageAnalysisClient
-        from azure.ai.vision.imageanalysis.models import VisualFeatures
-        from azure.core.credentials import AzureKeyCredential
-    except ImportError:
-        logger.info("azure-ai-vision-imageanalysis not installed; skipping Azure branch")
-        return None
-
-    settings = get_settings()
-    client = ImageAnalysisClient(
-        endpoint=settings.azure_vision_endpoint,
-        credential=AzureKeyCredential(settings.azure_vision_key),
-    )
-    analysis = client.analyze(image_data=content, visual_features=[VisualFeatures.READ])
-    return _map_azure_result(analysis)
-
-
-def _map_azure_result(analysis: object) -> OcrResult:
-    """Map an Azure ImageAnalysis result to :class:`OcrResult`.
-
-    Defensive about the SDK's optional/nested attributes — the synchronous ImageAnalysis
-    Read result exposes ``analysis.read.blocks[].lines[]``, each line carrying ``text`` and a
-    ``bounding_polygon`` (list of points). We collapse the polygon to an axis-aligned bbox.
-    """
-    lines: list[OcrLine] = []
-    text_parts: list[str] = []
-
-    read = getattr(analysis, "read", None)
-    blocks = getattr(read, "blocks", None) or []
-    page_no = 1  # ImageAnalysis Read returns a single logical page.
-
-    for block in blocks:
-        for line in getattr(block, "lines", None) or []:
-            line_text = getattr(line, "text", "") or ""
-            text_parts.append(line_text)
-            bbox = _polygon_to_bbox(getattr(line, "bounding_polygon", None), page_no)
-            lines.append(
-                OcrLine(
-                    text=line_text,
-                    page=page_no,
-                    bbox=bbox,
-                    confidence=_line_confidence(line),
-                )
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.post(
+                analyze_url,
+                headers={**auth, "Content-Type": "application/octet-stream"},
+                content=content,
             )
-
-    pages = 1 if lines else 0
-    return OcrResult(
-        engine=ENGINE_AZURE,
-        pages=pages,
-        text="\n".join(text_parts),
-        lines=lines,
-    )
-
-
-def _polygon_to_bbox(polygon: object, page: int) -> BBox | None:
-    """Collapse an Azure bounding polygon (list of points with .x/.y) to an axis-aligned BBox."""
-    if not polygon:
+            resp.raise_for_status()
+            op_location = (resp.headers.get("Operation-Location")
+                           or resp.headers.get("operation-location"))
+            if not op_location:
+                logger.warning("Azure Read: missing Operation-Location header")
+                return None
+            for _ in range(120):
+                poll = client.get(op_location, headers=auth)
+                poll.raise_for_status()
+                data = poll.json()
+                status = (data.get("status") or "").lower()
+                if status == "succeeded":
+                    return _map_v32(data)
+                if status == "failed":
+                    logger.warning("Azure Read reported status=failed")
+                    return None
+                time.sleep(0.5)
+    except httpx.HTTPError:
+        logger.exception("Azure OCR v3.2 request failed")
         return None
-    xs: list[float] = []
-    ys: list[float] = []
-    for point in polygon:
-        x = getattr(point, "x", None)
-        y = getattr(point, "y", None)
-        if x is None and isinstance(point, dict):
-            x = point.get("x")
-            y = point.get("y")
-        if x is None or y is None:
-            continue
-        try:
-            xs.append(float(x))
-            ys.append(float(y))
-        except (TypeError, ValueError):
-            continue
-    if not xs or not ys:
+    logger.warning("Azure Read polling timed out")
+    return None
+
+
+def _bbox_from_polygon(poly: object, page: int) -> BBox | None:
+    """v3.2 ``boundingBox`` is a flat [x1,y1,x2,y2,x3,y3,x4,y4]; collapse to an axis-aligned BBox."""
+    if not isinstance(poly, (list, tuple)) or len(poly) < 8:
+        return None
+    try:
+        xs = [float(v) for v in poly[0::2]]
+        ys = [float(v) for v in poly[1::2]]
+    except (TypeError, ValueError):
         return None
     return BBox(page=page, x0=min(xs), y0=min(ys), x1=max(xs), y1=max(ys))
 
 
-def _line_confidence(line: object) -> float | None:
-    """Extract a per-line confidence if the SDK exposes one (it often does not)."""
-    conf = getattr(line, "confidence", None)
-    if conf is None:
+def _map_v32(data: dict) -> OcrResult | None:
+    """Map an Azure Read v3.2 ``analyzeResults`` payload to :class:`OcrResult`."""
+    read_results = (data.get("analyzeResult") or {}).get("readResults") or []
+    lines: list[OcrLine] = []
+    texts: list[str] = []
+    for rr in read_results:
+        page = int(rr.get("page", 1) or 1)
+        for ln in rr.get("lines") or []:
+            text = ln.get("text", "") or ""
+            texts.append(text)
+            words = ln.get("words") or []
+            confs = [w["confidence"] for w in words
+                     if isinstance(w.get("confidence"), (int, float))]
+            conf = (sum(confs) / len(confs)) if confs else None
+            lines.append(OcrLine(text=text, page=page,
+                                 bbox=_bbox_from_polygon(ln.get("boundingBox"), page),
+                                 confidence=conf))
+    if not lines:
         return None
-    try:
-        return float(conf)
-    except (TypeError, ValueError):
-        return None
+    return OcrResult(engine=ENGINE_AZURE, pages=len(read_results) or 1,
+                     text="\n".join(texts), lines=lines)
 
 
 # ---------------------------------------------------------------------------
@@ -198,22 +210,6 @@ def _detect_kind(content: bytes, filename: str, mime: str | None) -> str:
     if m.startswith("text") or _looks_like_text(content, mime) is not None:
         return "text"
     return "unknown"
-
-
-def _fallback(content: bytes, *, filename: str, mime: str | None) -> OcrResult:
-    """Offline multi-format extraction (no Azure): pypdf/Tesseract for PDF, python-docx for DOCX,
-    Tesseract for images, text passthrough for text. All optional deps are lazy + guarded; never
-    raises. In production the Azure Vision branch above handles images/PDF instead."""
-    kind = _detect_kind(content, filename, mime)
-    if kind == "pdf":
-        return _pypdf_text_layer(content) or _pdf_ocr(content) or _empty()
-    if kind == "docx":
-        return _docx_extract(content) or _empty()
-    if kind == "image":
-        return _image_ocr(content) or _empty()
-    if kind == "text":
-        return _text_passthrough(content, mime=mime) or _empty()
-    return _text_passthrough(content, mime=mime) or _image_ocr(content) or _empty()
 
 
 def _docx_extract(content: bytes) -> OcrResult | None:
@@ -281,8 +277,11 @@ def _image_ocr(content: bytes) -> OcrResult | None:
     return OcrResult(engine=ENGINE_TESSERACT, pages=1, text="\n".join(texts), lines=lines)
 
 
-def _pdf_ocr(content: bytes) -> OcrResult | None:
-    """OCR a scanned (no text-layer) PDF: rasterize via pdf2image (poppler) then Tesseract."""
+def _pdf_ocr(content: bytes, *, page_ocr=None) -> OcrResult | None:
+    """OCR a scanned (no text-layer) PDF: rasterize via pdf2image (poppler), then OCR each page
+    with ``page_ocr`` (defaults to Tesseract; Azure Vision when configured)."""
+    if page_ocr is None:
+        page_ocr = _image_ocr
     try:
         from pdf2image import convert_from_bytes
     except ImportError:
@@ -295,19 +294,20 @@ def _pdf_ocr(content: bytes) -> OcrResult | None:
     import io
     all_lines: list[OcrLine] = []
     texts: list[str] = []
+    engine = ENGINE_TESSERACT
     for pageno, img in enumerate(images, start=1):
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        page = _image_ocr(buf.getvalue())
+        page = page_ocr(buf.getvalue())
         if page:
+            engine = page.engine
             for ln in page.lines:
                 ln.page = pageno
                 all_lines.append(ln)
             texts.append(page.text)
     if not all_lines:
         return None
-    return OcrResult(engine=ENGINE_TESSERACT, pages=len(images), text="\n\n".join(texts),
-                     lines=all_lines)
+    return OcrResult(engine=engine, pages=len(images), text="\n\n".join(texts), lines=all_lines)
 
 
 def _looks_like_text(content: bytes, mime: str | None) -> str | None:

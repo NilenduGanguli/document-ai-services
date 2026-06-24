@@ -76,83 +76,38 @@ def test_looks_like_pdf_heuristics():
     assert vision._looks_like_pdf(b"junk", filename="x.txt", mime="text/plain") is False
 
 
-def test_polygon_to_bbox_collapses_points():
-    class _P:
-        def __init__(self, x: float, y: float) -> None:
-            self.x = x
-            self.y = y
-
-    poly = [_P(10, 20), _P(110, 22), _P(112, 60), _P(8, 58)]
-    bbox = vision._polygon_to_bbox(poly, page=1)
-    assert bbox is not None
-    assert bbox.page == 1
-    assert bbox.x0 == 8 and bbox.y0 == 20
-    assert bbox.x1 == 112 and bbox.y1 == 60
-
-    # dict-shaped points are also supported
-    bbox2 = vision._polygon_to_bbox([{"x": 1, "y": 2}, {"x": 3, "y": 4}], page=2)
-    assert bbox2 is not None and bbox2.page == 2 and bbox2.x0 == 1 and bbox2.x1 == 3
-
-    assert vision._polygon_to_bbox(None, page=1) is None
-    assert vision._polygon_to_bbox([], page=1) is None
+def test_bbox_from_polygon_v32():
+    # v3.2 boundingBox is a flat [x1,y1,x2,y2,x3,y3,x4,y4]
+    bbox = vision._bbox_from_polygon([10, 20, 110, 22, 112, 60, 8, 58], page=1)
+    assert bbox is not None and bbox.page == 1
+    assert bbox.x0 == 8 and bbox.y0 == 20 and bbox.x1 == 112 and bbox.y1 == 60
+    assert vision._bbox_from_polygon(None, page=1) is None
+    assert vision._bbox_from_polygon([1, 2, 3, 4], page=1) is None  # too short
 
 
-def test_map_azure_result_with_fake_analysis():
-    """Exercise the Azure result mapper against a fake SDK shape (no SDK required)."""
-
-    class _Pt:
-        def __init__(self, x: float, y: float) -> None:
-            self.x = x
-            self.y = y
-
-    class _Line:
-        def __init__(self, text: str, poly: list[_Pt], conf: float | None) -> None:
-            self.text = text
-            self.bounding_polygon = poly
-            self.confidence = conf
-
-    class _Block:
-        def __init__(self, lines: list[_Line]) -> None:
-            self.lines = lines
-
-    class _Read:
-        def __init__(self, blocks: list[_Block]) -> None:
-            self.blocks = blocks
-
-    class _Analysis:
-        def __init__(self, read: _Read) -> None:
-            self.read = read
-
-    analysis = _Analysis(
-        _Read(
-            [
-                _Block(
-                    [
-                        _Line("HELLO", [_Pt(0, 0), _Pt(50, 0), _Pt(50, 10), _Pt(0, 10)], 0.99),
-                        _Line("WORLD", [_Pt(0, 12), _Pt(60, 12), _Pt(60, 22), _Pt(0, 22)], None),
-                    ]
-                )
+def test_map_v32_payload():
+    """Map an Azure Read v3.2 analyzeResults payload (the shape the cloud + mock both return)."""
+    payload = {
+        "status": "succeeded",
+        "analyzeResult": {
+            "readResults": [
+                {"page": 1, "lines": [
+                    {"text": "HELLO WORLD", "boundingBox": [0, 0, 60, 0, 60, 10, 0, 10],
+                     "words": [{"text": "HELLO", "confidence": 0.99},
+                               {"text": "WORLD", "confidence": 0.97}]},
+                    {"text": "536-90-4399", "boundingBox": [0, 12, 80, 12, 80, 22, 0, 22],
+                     "words": [{"text": "536-90-4399", "confidence": 0.95}]},
+                ]},
             ]
-        )
-    )
-
-    result = vision._map_azure_result(analysis)
-    assert result.engine == vision.ENGINE_AZURE
-    assert result.pages == 1
-    assert result.text == "HELLO\nWORLD"
+        },
+    }
+    result = vision._map_v32(payload)
+    assert result.engine == vision.ENGINE_AZURE and result.pages == 1
+    assert result.text == "HELLO WORLD\n536-90-4399"
     assert len(result.lines) == 2
-    assert result.lines[0].text == "HELLO"
-    assert result.lines[0].bbox is not None and result.lines[0].bbox.x1 == 50
-    assert result.lines[0].confidence == 0.99
-    assert result.lines[1].confidence is None
+    assert result.lines[0].bbox is not None and result.lines[0].bbox.x1 == 60
+    assert abs((result.lines[0].confidence or 0) - 0.98) < 1e-6
 
 
-def test_map_azure_result_empty_blocks():
-    class _Analysis:
-        read = None
-
-    result = vision._map_azure_result(_Analysis())
-    assert result.engine == vision.ENGINE_AZURE
-    assert result.pages == 0
-    assert result.text == ""
-    assert result.lines == []
+def test_map_v32_empty():
+    assert vision._map_v32({"analyzeResult": {"readResults": []}}) is None
