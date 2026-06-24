@@ -1,0 +1,41 @@
+flowchart TD
+    start["extract_pages content"]
+    empty_in{"content empty"}
+    detect["_detect_kind: magic bytes, mime, extension"]
+    kind{"detected kind"}
+
+    start --> empty_in
+    empty_in -->|"yes"| result_none["return empty result engine none"]
+    empty_in -->|"no"| detect
+    detect --> kind
+
+    kind -->|"image"| img_azure{"Azure configured"}
+    img_azure -->|"yes"| azread1["_azure_read Read v3.2"]
+    azread1 -->|"ok"| ok_azure["OcrResult engine azure-vision-read"]
+    azread1 -->|"none"| img_tess["_image_ocr Tesseract"]
+    img_azure -->|"no"| img_tess
+    img_tess --> ok_tess["OcrResult engine tesseract or empty"]
+
+    kind -->|"pdf"| pdf_layer["_pypdf_text_layer selectable text"]
+    pdf_layer -->|"found"| ok_pypdf["OcrResult engine pypdf"]
+    pdf_layer -->|"none scanned"| raster["_pdf_ocr rasterize via poppler"]
+    raster --> per_page{"Azure configured"}
+    per_page -->|"yes"| azread2["per page _azure_read Read v3.2"]
+    per_page -->|"no"| tess_page["per page Tesseract"]
+    azread2 --> ok_pdf_ocr["OcrResult per page engine or empty"]
+    tess_page --> ok_pdf_ocr
+
+    kind -->|"docx"| docx_x["_docx_extract python-docx"]
+    docx_x --> ok_docx["OcrResult engine docx or empty"]
+
+    kind -->|"text"| text_x["_text_passthrough decode UTF-8"]
+    text_x --> ok_text["OcrResult engine text or empty"]
+
+    kind -->|"unknown"| u_text["_text_passthrough"]
+    u_text -->|"text"| ok_u_text["OcrResult engine text"]
+    u_text -->|"not text"| u_azure{"Azure configured"}
+    u_azure -->|"yes"| azread3["_azure_read Read v3.2"]
+    azread3 -->|"ok"| ok_u_azure["OcrResult engine azure-vision-read"]
+    azread3 -->|"none"| u_tess["_image_ocr Tesseract"]
+    u_azure -->|"no"| u_tess
+    u_tess --> ok_u_tess["OcrResult engine tesseract or empty"]

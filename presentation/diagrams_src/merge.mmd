@@ -1,0 +1,23 @@
+flowchart TD
+    start["Ingest of a document version completes"]
+    fetch["Fetch current fact knodes for client via fetch_subtree current_only"]
+    filterFacts["Keep node_type fact rows that carry an attribute_key"]
+    toInputs["Map each to a FactInput with value, value_date, value_num, confidence"]
+    group["Group FactInputs by attribute_key"]
+    perKey["For each attribute_key group"]
+    winner["Winner equals highest confidence source, ties broken by input order"]
+    compare["Compute normalized comparable values, case-folded and whitespace-collapsed"]
+    conflictCheck{"Two or more distinct non-empty values?"}
+    flagConflict["Set conflict true and needs_review true"]
+    noConflict["conflict false and needs_review false"]
+    buildFact["Build ClientFact with resolved value from winner and all source_fact_ids"]
+    upsert["Upsert into client_merged_fact on conflict client_id and attribute_key"]
+    done["Client merged view rebuilt"]
+
+    start --> fetch --> filterFacts --> toInputs --> group --> perKey
+    perKey --> winner
+    perKey --> compare --> conflictCheck
+    conflictCheck -- "yes" --> flagConflict --> buildFact
+    conflictCheck -- "no" --> noConflict --> buildFact
+    winner --> buildFact
+    buildFact --> upsert --> done

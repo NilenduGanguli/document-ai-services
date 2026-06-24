@@ -1,0 +1,119 @@
+erDiagram
+    di_documents {
+        uuid id PK
+        text client_id
+        text document_name
+        text s3_uri
+        text sha256
+        text mime
+        text doc_type
+        text doc_category
+        text jurisdiction
+        jsonb lang_profile
+        text sensitivity_bucket
+        text gate_decision
+        real confidence
+        text ocr_engine
+        int page_count
+        text ocr_text
+        jsonb ocr_lines
+        timestamptz created_at
+        timestamptz deleted_at
+    }
+
+    doc_version {
+        uuid id PK
+        text client_id
+        uuid doc_id FK
+        int version_no
+        text content_hash
+        uuid supersedes
+        boolean is_current
+        jsonb changed_fields
+        timestamptz created_at
+    }
+
+    di_entity {
+        uuid id PK
+        text client_id
+        text entity_type
+        text normalized_name
+        jsonb attributes
+    }
+
+    knode {
+        uuid id PK
+        text client_id PK
+        uuid doc_id
+        uuid version_id
+        uuid parent_id
+        ltree path
+        text node_type
+        int seq
+        int depth
+        text title
+        text content
+        tsvector content_tsv
+        text context_prefix
+        text attribute_key
+        text value_text
+        date value_date
+        float value_num
+        text verification_status
+        real confidence
+        text sensitivity
+        date valid_from
+        date valid_to
+        uuid_array cross_refs
+        uuid_array entity_ids
+        jsonb provenance
+        timestamptz deleted_at
+    }
+
+    arep {
+        uuid id PK
+        text client_id PK
+        uuid knode_id
+        uuid doc_id
+        uuid version_id
+        ltree path
+        text rep_type
+        text rep_lang
+        text rep_text
+        tsvector rep_tsv
+        text gen_model
+    }
+
+    client_merged_fact {
+        uuid id PK
+        text client_id
+        text attribute_key
+        text resolved_value
+        date value_date
+        float value_num
+        real confidence
+        boolean conflict
+        boolean needs_review
+        uuid_array source_fact_ids
+    }
+
+    di_decision_trace {
+        uuid id PK
+        text client_id
+        uuid doc_id
+        jsonb classification
+        jsonb pii_entities
+        text sensitivity
+        text gate_decision
+        jsonb lang_profile
+    }
+
+    di_documents ||--o{ doc_version : "has versions"
+    di_documents ||--o{ knode : "ocr produces nodes"
+    di_documents ||--o{ di_decision_trace : "gate audit"
+    doc_version ||--o{ knode : "version owns nodes"
+    doc_version ||--o{ arep : "version owns reps"
+    knode ||--o{ arep : "indexed by reps"
+    knode ||--o| knode : "parent_id self reference"
+    di_entity ||--o{ knode : "referenced by entity_ids"
+    knode ||--o{ client_merged_fact : "merged via source_fact_ids"

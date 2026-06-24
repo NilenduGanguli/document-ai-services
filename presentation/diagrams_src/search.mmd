@@ -1,0 +1,42 @@
+sequenceDiagram
+    autonumber
+    actor Caller as "Downstream caller"
+    participant API as "search router"
+    participant DB as "db.pgvector_available"
+    participant RC as "retrieval gateway"
+    participant Store as "store.hybrid_search"
+    participant PG as "Postgres knode plus arep"
+    participant Serve as "serving.project_nodes"
+
+    Caller->>API: "POST clients id search SearchRequest"
+    API->>DB: "pgvector_available"
+    DB-->>API: "true or false"
+
+    alt "pgvector present"
+        API->>RC: "embed query single text"
+        RC-->>API: "query_embedding vector"
+    else "pgvector absent"
+        Note over API: "query_embedding stays null lexical only"
+    end
+
+    API->>Store: "hybrid_search client_id query_text query_embedding scope doc top_k current_only"
+    Note over Store,PG: "all SQL runs under RLS GUC for client_id"
+    Store->>PG: "lexical leg knode content_tsv websearch_to_tsquery"
+    PG-->>Store: "ranked knode ids"
+    Store->>PG: "lexical leg arep rep_tsv websearch_to_tsquery"
+    PG-->>Store: "ranked arep parent knode_ids"
+    opt "embedding supplied"
+        Store->>PG: "vector leg knode content_embedding HNSW cosine"
+        PG-->>Store: "ranked knode ids"
+        Store->>PG: "vector leg arep rep_embedding HNSW cosine"
+        PG-->>Store: "ranked arep parent knode_ids"
+    end
+    Store->>Store: "RRF fuse all legs take top_k"
+    Store->>PG: "fetch full knode rows by id any uuid array"
+    PG-->>Store: "knode rows"
+    Store-->>API: "ranked rows with rank and score"
+
+    API->>Serve: "project_nodes rows mask"
+    Serve->>Serve: "effective sensitivity then redact sensitive payloads"
+    Serve-->>API: "projected hits structure intact"
+    API-->>Caller: "client_id query count hits"

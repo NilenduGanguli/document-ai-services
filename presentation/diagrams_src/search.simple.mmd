@@ -1,0 +1,13 @@
+flowchart LR
+  Q["Downstream query<br/>(scoped to one client)"]:::e --> API["Serving<br/>API"]:::n
+  API --> K["Keyword<br/>search"]:::n
+  API --> V["Meaning<br/>search"]:::n
+  API --> S["Document<br/>structure"]:::n
+  K --> F{"Fuse &<br/>rank"}:::g
+  V --> F
+  S --> F
+  F --> ANS["Grounded answer<br/>+ source · optional masking"]:::k
+  classDef e fill:#1E2761,color:#ffffff,stroke:#1E2761,stroke-width:2px;
+  classDef g fill:#C8860D,color:#ffffff,stroke:#C8860D,stroke-width:3px;
+  classDef k fill:#CADCFC,color:#1E2761,stroke:#9DB6E8,stroke-width:2px;
+  classDef n fill:#F4F7FF,color:#1E2761,stroke:#9DB6E8,stroke-width:1px;

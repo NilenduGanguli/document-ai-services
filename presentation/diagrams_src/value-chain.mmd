@@ -1,0 +1,10 @@
+flowchart LR
+    A["Client<br/>documents<br/>(PDF · DOCX · IMG)"]:::inp --> B["OCR<br/>read the page"]
+    B --> C["Classify<br/>PII-safe gate"]
+    C --> D["Extract<br/>facts"]
+    D --> E["Knowledge<br/>tree<br/>(per client)"]
+    E --> F["Serving<br/>API"]:::out
+    F --> G["Downstream<br/>risk · onboarding<br/>· review"]:::sys
+    classDef inp fill:#1E2761,color:#ffffff,stroke:#1E2761,stroke-width:2px;
+    classDef out fill:#E6A817,color:#1E2761,stroke:#E6A817,stroke-width:2px;
+    classDef sys fill:#CADCFC,color:#1E2761,stroke:#9DB6E8,stroke-width:2px;

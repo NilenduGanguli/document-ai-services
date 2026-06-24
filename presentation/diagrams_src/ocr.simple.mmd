@@ -1,0 +1,14 @@
+flowchart LR
+  A["Client<br/>document"]:::e --> B{"Format?"}:::g
+  B -->|"Digital PDF"| C["Read text layer"]:::n
+  B -->|"Word (DOCX)"| D["Read document"]:::n
+  B -->|"Image / scan"| E["Azure Read<br/>OCR"]:::n
+  C --> R["Text + layout,<br/>per page"]:::k
+  D --> R
+  E --> R
+  E -. "offline dev / test" .-> M["Local OCR mock"]:::d
+  classDef e fill:#1E2761,color:#ffffff,stroke:#1E2761,stroke-width:2px;
+  classDef g fill:#C8860D,color:#ffffff,stroke:#C8860D,stroke-width:3px;
+  classDef k fill:#CADCFC,color:#1E2761,stroke:#9DB6E8,stroke-width:2px;
+  classDef n fill:#F4F7FF,color:#1E2761,stroke:#9DB6E8,stroke-width:1px;
+  classDef d fill:#EEF3FF,color:#5A6480,stroke:#9DB6E8,stroke-width:1px;

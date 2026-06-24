@@ -1,0 +1,36 @@
+flowchart TD
+    root["knode document<br/>path client_42.doctype_passport.v1"]
+
+    sec0["knode section page 1<br/>path ...v1.s0"]
+    sec1["knode section page 2<br/>path ...v1.s1"]
+    facts["knode section facts<br/>path ...v1.s2"]
+
+    c00["knode chunk<br/>path ...v1.s0.c0"]
+    c01["knode chunk<br/>path ...v1.s0.c1"]
+    c10["knode chunk<br/>path ...v1.s1.c0"]
+
+    f0["knode fact<br/>identity.surname"]
+    f1["knode fact<br/>identity.date_of_birth"]
+    f2["knode fact<br/>id.passport_number"]
+
+    root --> sec0
+    root --> sec1
+    root --> facts
+    sec0 --> c00
+    sec0 --> c01
+    sec1 --> c10
+    facts --> f0
+    facts --> f1
+    facts --> f2
+
+    rq["arep hypothetical_q en"]
+    rp["arep proposition en"]
+    rs["arep summary en"]
+    ra["arep alt_phrasing en"]
+    rt["arep translation es"]
+
+    c00 -.indexes.-> rq
+    c00 -.indexes.-> rp
+    c00 -.indexes.-> rs
+    c00 -.indexes.-> ra
+    c00 -.indexes.-> rt

@@ -1,0 +1,12 @@
+flowchart TD
+  D1["Document 1<br/>facts"]:::n --> M{"Merge<br/>per client"}:::g
+  D2["Document 2<br/>facts"]:::n --> M
+  D3["Document N<br/>facts"]:::n --> M
+  M -->|"agree"| C["Consolidated<br/>client view"]:::k
+  M -->|"disagree"| FL["Flag conflict<br/>for review"]:::e
+  RU["Re-upload"]:::n --> NV["New version<br/>(history kept)"]:::k
+  NV --> M
+  classDef e fill:#1E2761,color:#ffffff,stroke:#1E2761,stroke-width:2px;
+  classDef g fill:#C8860D,color:#ffffff,stroke:#C8860D,stroke-width:3px;
+  classDef k fill:#CADCFC,color:#1E2761,stroke:#9DB6E8,stroke-width:2px;
+  classDef n fill:#F4F7FF,color:#1E2761,stroke:#9DB6E8,stroke-width:1px;

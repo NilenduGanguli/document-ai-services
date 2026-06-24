@@ -1,0 +1,14 @@
+flowchart TB
+  subgraph C["Per client — isolated & access-controlled"]
+    direction TB
+    DOC["Documents"]:::e --> VER["Versions"]:::n
+    VER --> KN["Knowledge nodes"]:::k
+    KN --> AR["Search representations"]:::n
+    KN --> MF["Merged facts"]:::k
+    DOC --> ENT["Entities"]:::n
+    DOC --> AUD["Audit / decisions"]:::n
+  end
+  style C fill:#F4F7FF,stroke:#9DB6E8,stroke-width:1px,color:#1E2761;
+  classDef e fill:#1E2761,color:#ffffff,stroke:#1E2761,stroke-width:2px;
+  classDef k fill:#CADCFC,color:#1E2761,stroke:#9DB6E8,stroke-width:2px;
+  classDef n fill:#F4F7FF,color:#1E2761,stroke:#9DB6E8,stroke-width:1px;

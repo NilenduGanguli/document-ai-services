@@ -1,0 +1,67 @@
+```mermaid
+flowchart TD
+    subgraph clientside["Client side"]
+        uploader["Uploader or console SPA"]
+        consumer["Downstream KYC consumer"]
+    end
+
+    subgraph app["FastAPI app — di.app:app on port 8080"]
+        static["Static console at slash and slash assets"]
+        ingestrouter["Ingest router — POST ingest, SSE"]
+        clientsrouter["Clients router — tree, facts, documents, changes, manifest, answerable"]
+        searchrouter["Search router — hybrid scoped search"]
+        nodesrouter["Nodes router — provenance"]
+
+        subgraph pipeline["Ingestion pipeline — di.pipeline.ingest_document"]
+            ocr["OCR layer — di.ocr.vision.extract_pages"]
+            gate["PII-safe gate — di.gate.pipeline.run_gate"]
+            extract["Dual extraction — deterministic plus LLM"]
+            subtree["Subtree build — knode, arep, context"]
+            merge["Cross-document merge — confidence weighted"]
+            version["Versioning — content hash, is_current flip"]
+        end
+
+        serving["Serving transforms — di.serving nest_tree, project, manifest"]
+    end
+
+    subgraph external["External dependencies"]
+        retrieval["retrieval gateway — embed, llm complete, rerank, models"]
+        mockocr["mock-azure-ocr container — Read v3.2 contract"]
+        realazure["Real Azure Computer Vision Read v3.2"]
+    end
+
+    subgraph storage["Storage — Postgres 16 plus pgvector plus ltree"]
+        store["Repository — di.store via di.db.acquire with RLS GUC"]
+        tables["di_documents, doc_version, knode, arep, client_merged_fact, di_entity, di_decision_trace"]
+    end
+
+    uploader -->|"multipart upload"| ingestrouter
+    uploader -->|"loads UI"| static
+    ingestrouter --> pipeline
+
+    ocr -->|"httpx Read v3.2"| mockocr
+    ocr -->|"httpx Read v3.2, real resource"| realazure
+    ocr --> gate
+    gate --> extract
+    extract -->|"SEND_TO_LLM only"| retrieval
+    extract --> subtree
+    subtree -->|"embed nodes and reps"| retrieval
+    subtree --> merge
+    merge --> version
+    version --> store
+
+    clientsrouter --> store
+    searchrouter --> store
+    searchrouter -->|"embed query"| retrieval
+    nodesrouter --> store
+    store --> tables
+    store --> serving
+
+    serving --> clientsrouter
+    serving --> searchrouter
+    serving --> nodesrouter
+
+    consumer -->|"client_id scoped, X-API-KEY"| clientsrouter
+    consumer --> searchrouter
+    consumer --> nodesrouter
+```
