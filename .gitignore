@@ -30,6 +30,10 @@ htmlcov/
 .idea/
 .vscode/
 
+# QA / browser artifacts
+.playwright-mcp/
+console-*.png
+
 # Local data / models
 .minio-data/
 models_cache/

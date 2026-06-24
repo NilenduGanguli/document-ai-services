@@ -30,9 +30,26 @@ def _redact(value: str | None) -> str | None:
     return "•" * (len(value) - 4) + value[-4:]
 
 
+_SENS_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
+
+def _effective_sensitivity(row: dict[str, Any]) -> str:
+    """Max of the node's stored sensitivity and the level implied by its attribute key.
+
+    Different deterministic extractors set per-field sensitivity inconsistently, but the canonical
+    ``attribute_key`` (``id.*`` → CRITICAL, ``identity.*``/``address.*`` → HIGH) is reliable — so
+    masking a CURP/SSN/passport-number never depends on which extractor produced it.
+    """
+    stored = str(row.get("sensitivity") or "LOW")
+    key_sens = sensitivity_for_key(row.get("attribute_key"))
+    return key_sens if _SENS_ORDER.get(key_sens, 0) > _SENS_ORDER.get(stored, 0) else stored
+
+
 def _project_node(row: dict[str, Any], *, mask: bool) -> dict[str, Any]:
     out = {k: row.get(k) for k in _NODE_FIELDS}
-    if mask and str(row.get("sensitivity")) in _MASKABLE:
+    eff = _effective_sensitivity(row)
+    out["sensitivity"] = eff  # surfaced pill matches the masking decision
+    if mask and eff in _MASKABLE:
         # Mask only the sensitive payload; structure, provenance, type, confidence stay intact.
         out["value_text"] = _redact(out.get("value_text"))
         if out.get("content"):

@@ -39,6 +39,10 @@ services:
       DI_LOG_LEVEL: INFO
     ports:
       - "8080:8080"
+    volumes:
+      # Live-mount code so UI/backend edits apply on container restart without a rebuild.
+      - ./frontend/dist:/app/frontend/dist:ro
+      - ./di:/app/di:ro
     depends_on:
       db:
         condition: service_healthy

@@ -27,7 +27,8 @@ class _CachedStatic(StaticFiles):
     async def get_response(self, path, scope):
         resp = await super().get_response(path, scope)
         if resp.status_code == 200:
-            resp.headers["cache-control"] = "public, max-age=3600"
+            # Console assets are not content-hashed → revalidate so edits are picked up.
+            resp.headers["cache-control"] = "no-cache"
         return resp
 
 
@@ -40,9 +41,13 @@ def _mount_frontend(app: FastAPI) -> None:
     if assets.is_dir():
         app.mount("/assets", _CachedStatic(directory=str(assets)), name="assets")
 
+    def _index() -> FileResponse:
+        # never cache the shell, so versioned asset refs (?v=) are always re-read on reload
+        return FileResponse(index, media_type="text/html", headers={"cache-control": "no-cache"})
+
     @app.get("/", include_in_schema=False)
     async def _root() -> FileResponse:
-        return FileResponse(index, media_type="text/html")
+        return _index()
 
     @app.get("/{full_path:path}", include_in_schema=False, response_model=None)
     async def _spa(full_path: str):
@@ -52,8 +57,8 @@ def _mount_frontend(app: FastAPI) -> None:
         try:
             candidate.relative_to(dist.resolve())
         except ValueError:
-            return FileResponse(index, media_type="text/html")
-        return FileResponse(candidate if candidate.is_file() else index)
+            return _index()
+        return FileResponse(candidate) if candidate.is_file() else _index()
 
     logger.info("serving frontend console from %s", dist)
 
