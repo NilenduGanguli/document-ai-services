@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Engine identifiers (kept as constants so callers can compare without typos).
 ENGINE_AZURE = "azure-vision-read"
 ENGINE_PYPDF = "pypdf"
+ENGINE_TEXT = "text"
 ENGINE_NONE = "none"
 
 
@@ -182,12 +183,42 @@ def _fallback(
     filename: str,
     mime: str | None,
 ) -> OcrResult:
-    """Best-effort offline extraction: pypdf text layer, else an empty ``none`` result."""
+    """Best-effort offline extraction: pypdf text layer, text passthrough, else empty ``none``."""
     if _looks_like_pdf(content, filename=filename, mime=mime):
         pdf_result = _pypdf_text_layer(content)
         if pdf_result is not None:
             return pdf_result
+    text_result = _text_passthrough(content, mime=mime)
+    if text_result is not None:
+        return text_result
     return OcrResult(engine=ENGINE_NONE, pages=0, text="", lines=[])
+
+
+def _looks_like_text(content: bytes, mime: str | None) -> str | None:
+    """Return the decoded string if the bytes are UTF-8 text (or mime is ``text/*``)."""
+    if mime and mime.lower().startswith("text"):
+        return content.decode("utf-8", errors="replace")
+    try:
+        decoded = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not decoded.strip():
+        return None
+    printable = sum(ch.isprintable() or ch.isspace() for ch in decoded)
+    return decoded if printable / max(len(decoded), 1) >= 0.9 else None
+
+
+def _text_passthrough(content: bytes, *, mime: str | None) -> OcrResult | None:
+    """Treat already-textual input as OCR output directly.
+
+    Covers ``text/*`` uploads and decodable UTF-8 bytes (pre-OCR'd exports, plain-text KYC
+    documents, local/dev ingestion without a live OCR engine). One ``OcrLine`` per non-empty line.
+    """
+    decoded = _looks_like_text(content, mime)
+    if decoded is None:
+        return None
+    lines = [OcrLine(text=ln.strip(), page=1) for ln in decoded.splitlines() if ln.strip()]
+    return OcrResult(engine=ENGINE_TEXT, pages=1, text=decoded.strip(), lines=lines)
 
 
 def _looks_like_pdf(content: bytes, *, filename: str, mime: str | None) -> bool:

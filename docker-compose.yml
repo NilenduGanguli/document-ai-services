@@ -1,0 +1,47 @@
+# Local stack: Postgres-with-pgvector + the Document Intelligence app.
+# Bring up:  docker compose up --build
+# The app's startup applies migrations and (because pgvector is present here) adds the
+# embedding columns + HNSW indexes, so the full vector path is exercised — unlike a bare
+# local Postgres without pgvector.
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: di
+      POSTGRES_PASSWORD: di
+      POSTGRES_DB: document_intelligence
+    ports:
+      - "5433:5432"          # host 5433 to avoid clashing with a host Postgres on 5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U di -d document_intelligence"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    environment:
+      PG_HOST: db
+      PG_PORT: "5432"
+      PG_USER: di
+      PG_PASSWORD: di
+      PG_DATABASE: document_intelligence
+      PG_SCHEMA: di
+      PG_HASH_PARTITIONS: "8"
+      RLS_ENABLED: "false"          # demo connects as the DB owner; prod uses a non-superuser + RLS
+      DI_RETRIEVAL_STUB: "true"     # offline model gateway; set false + RETRIEVAL_BASE_URL for real
+      RETRIEVAL_BASE_URL: ""        # e.g. http://host.docker.internal:8000 once its gateway is deployed
+      RETRIEVAL_API_KEY: ""
+      EMBEDDING_DIM_DEFAULT: "768"
+      AREP_ASYNC: "false"           # generate accessibility reps synchronously for the demo
+      DI_LOG_LEVEL: INFO
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata: {}

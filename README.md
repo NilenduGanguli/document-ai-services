@@ -30,6 +30,23 @@ pytest -q                                # pure-logic tests run without a DB; ma
 `DI_RETRIEVAL_STUB=true` runs against an in-process fake of the retrieval model gateway
 (zero-vectors + echo completions) so the pipeline is exercisable without the live service.
 
+## Run as a container (full stack, with pgvector)
+```bash
+docker compose up --build        # Postgres-with-pgvector + the app on http://localhost:8080
+```
+The app applies migrations on startup and — because the compose DB ships pgvector — creates the
+`vector` extension, embedding columns, and HNSW indexes (the local Homebrew Postgres lacks
+pgvector, so a bare `pytest`/uvicorn run degrades to FTS-only search). Point at the real model
+gateway by setting `RETRIEVAL_BASE_URL` and `DI_RETRIEVAL_STUB=false` in `docker-compose.yml`.
+
+**Exercise every flow + generate a report:**
+```bash
+DI_BASE_URL=http://localhost:8080 python tools/flow_report.py
+# writes reports/local-flow-test-report.md (ingest SSE, tree, masking, facts, search,
+# manifest, answerable-questions, provenance, version deltas) using the samples/ fixtures.
+```
+Tear down: `docker compose down -v` (and `colima stop` to halt the VM).
+
 ## Layout
 See the design spec §10. Foundation: `di/config.py`, `di/db.py`, `di/retrieval_client.py`,
 `di/models.py`, `di/ontology.py`, `di/app.py`, `di/migrations/`. Modules: `di/ocr`, `di/gate`,

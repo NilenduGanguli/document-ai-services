@@ -146,7 +146,7 @@ async def run_migrations(settings: Settings | None = None) -> None:
     async with pool.acquire() as conn:
         await conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{settings.pg_schema}";')
         await _init_conn(conn)
-        await _discover_pgvector(conn)
+        await _try_enable_pgvector(conn)
 
         for path in sorted(_MIGRATIONS_DIR.glob("*.sql")):
             sql = path.read_text(encoding="utf-8").replace("__SCHEMA__", f'"{settings.pg_schema}"')
@@ -161,6 +161,22 @@ async def run_migrations(settings: Settings | None = None) -> None:
             await _create_hash_partitions(conn, table, settings.pg_hash_partitions)
 
         await _ensure_vector_columns(conn, settings)
+
+
+async def _try_enable_pgvector(conn: asyncpg.Connection) -> None:
+    """Attempt ``CREATE EXTENSION vector`` (guarded), then (re)discover its schema.
+
+    On the pgvector image the extension is *available* but not yet created; on plain Postgres
+    without pgvector the CREATE fails and we degrade cleanly to FTS-only search.
+    """
+    global _pgvector_schema, _pgvector_checked
+    try:
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+    except Exception:  # noqa: BLE001 - extension unavailable on this server; degrade gracefully
+        logger.info("pgvector extension unavailable; vector features disabled")
+    _pgvector_checked = False
+    _pgvector_schema = None
+    await _discover_pgvector(conn)
 
 
 async def _ensure_vector_columns(conn: asyncpg.Connection, settings: Settings) -> None:

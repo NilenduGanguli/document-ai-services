@@ -50,8 +50,8 @@ def test_azure_branch_guarded_by_settings(monkeypatch):
     result = vision.extract_pages(b"%PDF-1.4 fake", filename="x.pdf")
     assert called["azure"] is False
     assert isinstance(result, OcrResult)
-    # Bytes look like a PDF; pypdf may or may not be installed -> pypdf or none engine.
-    assert result.engine in {vision.ENGINE_PYPDF, vision.ENGINE_NONE}
+    # Bytes look like a PDF but are ASCII; without pypdf they decode via the text passthrough.
+    assert result.engine in {vision.ENGINE_PYPDF, vision.ENGINE_NONE, vision.ENGINE_TEXT}
 
 
 def test_azure_exception_falls_back(monkeypatch):
