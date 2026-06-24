@@ -341,3 +341,17 @@ Azure DI container.
   other agent; document_intelligence keeps its own per-client scoped vector index, no COIN/VDI
   creds) and D13 (ALL §3.9 capabilities in v1 incl. toggleable, non-breaking masking/redaction).
   Resolved Q-L and Q-N.
+- **2026-06-24 (8) — IMPLEMENTATION (M0–M5 cores).** Built the repo at `~/document_intelligence`
+  (git, 4 milestone commits), ~6.3k LOC + ~3.1k test LOC, 216 tests (ruff clean; passing, optional
+  `[ml]`/live-DB paths skip-gated). Foundation (config, models, ontology, RLS+ltree+pgvector-gated
+  data layer, migrations verified on live Postgres, retrieval gateway client + offline stub); leaf
+  modules (OCR; PII-safe gate: language/anchors+checksums/classifier/Presidio/routing; deterministic
+  extractors passport-MRZ/US/CA/MX incl. CURP-hard/RFC-soft/INE); knowledge subtree (`knode`+`arep`,
+  structure-aware chunking, store with index-many/return-parent hybrid search); transforms (build,
+  context prefixes, accessibility reps, LLM extract, gate orchestrator); end-to-end `ingest_document`
+  pipeline (verified live: an INE/CURP doc stayed local, checksum-verified extraction, merged client
+  view); serving (tree nesting, toggleable masking, manifest, answerable-questions) + API routers
+  (ingest SSE, clients, search, nodes); FastAPI app serves. Built via two parallel agent fan-outs
+  (14 + 5 modules). **Remaining (blocked on external inputs, not code):** install pgvector; provision
+  Azure Vision key; deploy the retrieval-API additions; classifier weak-supervision training (needs
+  sample corpus, Q-M); optional eval harness. The `[ml]` extras gate 4 tests until installed.
