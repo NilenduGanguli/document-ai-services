@@ -16,6 +16,9 @@ COPY pyproject.toml README.md ./
 COPY di ./di
 RUN uv pip install --system -e ".[extract]"
 
+# Static console (served from /app/frontend/dist by the app).
+COPY frontend ./frontend
+
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
