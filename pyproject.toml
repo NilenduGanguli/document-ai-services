@@ -25,9 +25,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Document parsing / deterministic ID extraction
+# Document parsing / OCR / deterministic ID extraction
 extract = [
     "mrz>=0.6",              # ICAO 9303 MRZ parsing/validation (passport)
+    "pypdf>=4.0",            # PDF text-layer extraction (digital PDFs)
+    "python-docx>=1.1",      # .docx text extraction
+    "pillow>=10.0",          # image loading for OCR
+    "pytesseract>=0.3.10",   # Tesseract OCR bindings (PNG/JPEG, scanned PDFs) — needs the tesseract binary
+    "pdf2image>=1.17",       # rasterize scanned PDFs for OCR — needs poppler
 ]
 # Local PII-safe classifier + PII gate (heavy; lazy-imported)
 ml = [
@@ -44,6 +49,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
     "mypy>=1.9",
+    "fpdf2>=2.7",            # generate digital-PDF test fixtures
 ]
 
 [build-system]

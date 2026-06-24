@@ -6,6 +6,11 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# System OCR deps: tesseract (images / scanned PDFs) + poppler (pdf2image rasterization).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tesseract-ocr poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 # uv (fast installer) from the official distroless image.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 

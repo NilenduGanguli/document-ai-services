@@ -39,6 +39,13 @@ The app applies migrations on startup and — because the compose DB ships pgvec
 pgvector, so a bare `pytest`/uvicorn run degrades to FTS-only search). Point at the real model
 gateway by setting `RETRIEVAL_BASE_URL` and `DI_RETRIEVAL_STUB=false` in `docker-compose.yml`.
 
+**Supported input formats** (offline, no Azure key): **PDF** (digital → pypdf text layer; scanned →
+Tesseract via poppler), **DOCX** (python-docx), **PNG/JPEG** (Tesseract OCR), and plain text. In
+production, Azure AI Vision Read handles PDF/images instead (set `AZURE_VISION_*`); Tesseract image
+OCR is lossy (e.g. 0→O), so prefer Azure for images. Generate real fixtures with
+`python tools/make_samples.py` → `samples/generated/{passport.pdf, ssn_card.docx,
+ine_credencial.png, utility_bill.jpg}`.
+
 **Exercise every flow + generate a report:**
 ```bash
 DI_BASE_URL=http://localhost:8080 python tools/flow_report.py

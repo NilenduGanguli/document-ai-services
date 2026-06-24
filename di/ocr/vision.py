@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 # Engine identifiers (kept as constants so callers can compare without typos).
 ENGINE_AZURE = "azure-vision-read"
 ENGINE_PYPDF = "pypdf"
+ENGINE_DOCX = "docx"
+ENGINE_TESSERACT = "tesseract"
 ENGINE_TEXT = "text"
 ENGINE_NONE = "none"
 
@@ -177,21 +179,135 @@ def _line_confidence(line: object) -> float | None:
 # ---------------------------------------------------------------------------
 # Deterministic fallback
 # ---------------------------------------------------------------------------
-def _fallback(
-    content: bytes,
-    *,
-    filename: str,
-    mime: str | None,
-) -> OcrResult:
-    """Best-effort offline extraction: pypdf text layer, text passthrough, else empty ``none``."""
-    if _looks_like_pdf(content, filename=filename, mime=mime):
-        pdf_result = _pypdf_text_layer(content)
-        if pdf_result is not None:
-            return pdf_result
-    text_result = _text_passthrough(content, mime=mime)
-    if text_result is not None:
-        return text_result
+def _empty() -> OcrResult:
     return OcrResult(engine=ENGINE_NONE, pages=0, text="", lines=[])
+
+
+def _detect_kind(content: bytes, filename: str, mime: str | None) -> str:
+    """Classify the upload into pdf | docx | image | text | unknown (magic / mime / extension)."""
+    fn = filename.lower()
+    m = (mime or "").lower()
+    if content[:5] == b"%PDF-" or "pdf" in m or fn.endswith(".pdf"):
+        return "pdf"
+    if fn.endswith(".docx") or "word" in m or "officedocument.wordprocessing" in m:
+        return "docx"
+    if (content[:8].startswith(b"\x89PNG") or content[:3] == b"\xff\xd8\xff"
+            or m.startswith("image/")
+            or fn.endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".heic"))):
+        return "image"
+    if m.startswith("text") or _looks_like_text(content, mime) is not None:
+        return "text"
+    return "unknown"
+
+
+def _fallback(content: bytes, *, filename: str, mime: str | None) -> OcrResult:
+    """Offline multi-format extraction (no Azure): pypdf/Tesseract for PDF, python-docx for DOCX,
+    Tesseract for images, text passthrough for text. All optional deps are lazy + guarded; never
+    raises. In production the Azure Vision branch above handles images/PDF instead."""
+    kind = _detect_kind(content, filename, mime)
+    if kind == "pdf":
+        return _pypdf_text_layer(content) or _pdf_ocr(content) or _empty()
+    if kind == "docx":
+        return _docx_extract(content) or _empty()
+    if kind == "image":
+        return _image_ocr(content) or _empty()
+    if kind == "text":
+        return _text_passthrough(content, mime=mime) or _empty()
+    return _text_passthrough(content, mime=mime) or _image_ocr(content) or _empty()
+
+
+def _docx_extract(content: bytes) -> OcrResult | None:
+    """Extract text from a .docx via python-docx (paragraphs + table cells). Lazy + guarded."""
+    try:
+        import docx  # python-docx
+    except ImportError:
+        return None
+    import io
+    try:
+        document = docx.Document(io.BytesIO(content))
+    except Exception:  # noqa: BLE001 - not a valid docx / parse error
+        return None
+    parts = [p.text.strip() for p in document.paragraphs if p.text.strip()]
+    for tbl in document.tables:
+        for row in tbl.rows:
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                parts.append("  ".join(cells))
+    if not parts:
+        return None
+    lines = [OcrLine(text=p, page=1) for p in parts]
+    return OcrResult(engine=ENGINE_DOCX, pages=1, text="\n".join(parts), lines=lines)
+
+
+def _image_ocr(content: bytes) -> OcrResult | None:
+    """OCR an image with Tesseract (pytesseract + Pillow), grouping words into lines with bboxes."""
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return None
+    import io
+    try:
+        img = Image.open(io.BytesIO(content))
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    except Exception:  # noqa: BLE001 - tesseract missing / unreadable image
+        logger.exception("tesseract OCR failed")
+        return None
+    groups: dict[tuple, dict] = {}
+    for i in range(len(data["text"])):
+        word = (data["text"][i] or "").strip()
+        if not word:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        x, y, w, hgt = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        g = groups.setdefault(key, {"w": [], "x0": x, "y0": y, "x1": x + w, "y1": y + hgt, "c": []})
+        g["w"].append(word)
+        g["x0"], g["y0"] = min(g["x0"], x), min(g["y0"], y)
+        g["x1"], g["y1"] = max(g["x1"], x + w), max(g["y1"], y + hgt)
+        try:
+            g["c"].append(float(data["conf"][i]))
+        except (TypeError, ValueError, KeyError):
+            pass
+    lines, texts = [], []
+    for _, g in sorted(groups.items()):
+        text = " ".join(g["w"])
+        texts.append(text)
+        conf = (sum(g["c"]) / len(g["c"]) / 100.0) if g["c"] else None
+        lines.append(OcrLine(text=text, page=1,
+                             bbox=BBox(page=1, x0=g["x0"], y0=g["y0"], x1=g["x1"], y1=g["y1"]),
+                             confidence=conf))
+    if not lines:
+        return None
+    return OcrResult(engine=ENGINE_TESSERACT, pages=1, text="\n".join(texts), lines=lines)
+
+
+def _pdf_ocr(content: bytes) -> OcrResult | None:
+    """OCR a scanned (no text-layer) PDF: rasterize via pdf2image (poppler) then Tesseract."""
+    try:
+        from pdf2image import convert_from_bytes
+    except ImportError:
+        return None
+    try:
+        images = convert_from_bytes(content, dpi=200)
+    except Exception:  # noqa: BLE001 - poppler missing / render error
+        logger.exception("pdf2image render failed")
+        return None
+    import io
+    all_lines: list[OcrLine] = []
+    texts: list[str] = []
+    for pageno, img in enumerate(images, start=1):
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        page = _image_ocr(buf.getvalue())
+        if page:
+            for ln in page.lines:
+                ln.page = pageno
+                all_lines.append(ln)
+            texts.append(page.text)
+    if not all_lines:
+        return None
+    return OcrResult(engine=ENGINE_TESSERACT, pages=len(images), text="\n\n".join(texts),
+                     lines=all_lines)
 
 
 def _looks_like_text(content: bytes, mime: str | None) -> str | None:
