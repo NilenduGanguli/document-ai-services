@@ -6,7 +6,9 @@ No secrets are hard-coded; everything comes from the environment / ``.env``.
 from __future__ import annotations
 
 from functools import lru_cache
+from urllib.parse import urlparse
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +19,7 @@ class Settings(BaseSettings):
 
     # --- App ---
     app_name: str = "document-intelligence"
+    di_env: str = "local"                    # local | dev | staging | prod
     di_log_level: str = "INFO"
     di_executor_workers: int = 32
 
@@ -42,10 +45,25 @@ class Settings(BaseSettings):
     azure_vision_endpoint: str = ""
     azure_vision_key: str = ""
 
+    # --- AuthN / AuthZ ---
+    # Disable ONLY for a local demo; every /api/v1 route is unauthenticated when false.
+    auth_enabled: bool = True
+    # Seeds a wildcard key at startup so a fresh container is usable from env alone.
+    di_bootstrap_api_key: str = ""
+
     # --- Gate / pipeline ---
     gate_default_open: bool = True
     classifier_confidence_floor: float = 0.55
-    masking_enabled_default: bool = False
+    # Server-side default for the serving masking projection. Fail-closed: sensitive values are
+    # redacted unless the caller explicitly (and with clearance) asks for them.
+    mask_by_default: bool = True
+    ingest_concurrency: int = 4              # max ingest jobs processed at once per instance
+
+    # --- Request limits (unbounded requests/responses are a DoS + gateway-timeout risk) ---
+    max_upload_mb: int = 25
+    max_top_k: int = 100
+    default_page_size: int = 50
+    max_page_size: int = 200
 
     # --- Chunking / embeddings ---
     chunk_max_tokens: int = 512
@@ -58,16 +76,51 @@ class Settings(BaseSettings):
     supported_languages: tuple[str, ...] = ("en", "es")
     supported_jurisdictions: tuple[str, ...] = ("US", "CA", "MX")
 
-    # --- Object storage (optional) ---
-    s3_enabled: bool = False
-    s3_endpoint: str = ""
+    # --- Ontology ---
+    # Stamped into provenance + merged facts so a fact's vintage is identifiable after changes.
+    ontology_version: str = "1.0.0"
+
+    # --- Blob storage: where the raw uploaded bytes live ---
+    # postgres = bytea in di_blob | local = filesystem/docker volume | s3 = S3/MinIO | none = don't retain
+    blob_backend: str = "postgres"
+    blob_local_dir: str = "/data/blobs"
+    s3_endpoint: str = ""                    # set for MinIO/S3-compatible; empty = real AWS
     s3_bucket: str = "document-intelligence"
     s3_access_key: str = ""
     s3_secret_key: str = ""
+    s3_region: str = "us-east-1"
+    s3_prefix: str = "documents"
+
+    @field_validator("blob_backend")
+    @classmethod
+    def _valid_blob_backend(cls, v: str) -> str:
+        allowed = {"postgres", "local", "s3", "none"}
+        if v not in allowed:
+            raise ValueError(f"blob_backend must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
+    @field_validator("azure_vision_endpoint", "retrieval_base_url")
+    @classmethod
+    def _sane_url(cls, v: str) -> str:
+        """Reject malformed egress URLs at startup rather than at first request."""
+        if not v:
+            return v
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError(f"must be an http(s) URL with a host, got {v!r}")
+        return v
 
     @property
     def has_azure_vision(self) -> bool:
         return bool(self.azure_vision_endpoint and self.azure_vision_key)
+
+    @property
+    def max_upload_bytes(self) -> int:
+        return self.max_upload_mb * 1024 * 1024
+
+    @property
+    def is_production(self) -> bool:
+        return self.di_env.lower() in ("staging", "prod", "production")
 
     @property
     def qualified_schema(self) -> str:

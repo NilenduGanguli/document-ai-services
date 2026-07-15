@@ -5,6 +5,12 @@ Unified document-intelligence platform for banking KYC. It turns a client's docu
 downstream services via an API for search, single-document Q&A, and structured fact retrieval —
 PII-safe throughout.
 
+- **Console:** a React (Vite + TS) SPA compiled into `frontend/dist` and served by FastAPI itself —
+  dashboard/readiness, drag-drop ingest with live pipeline stages, knowledge tree with a provenance
+  drawer, merged facts, hybrid search, jobs, and an admin/erasure page.
+- **Ingest is async:** `POST /api/v1/ingest` returns **202 + `job_id`**; poll `GET /api/v1/jobs/{id}`
+  for live stages and the terminal outcome. A dropped connection no longer loses the work.
+  `?stream=true` keeps the original SSE-on-one-connection behaviour.
 - **Geography / languages:** US, Canada, Mexico · English + Spanish.
 - **The star:** a per-document **knowledge subtree** — `knode` (returnable nodes) + `arep`
   (multi-vector accessibility representations) — that is semantically configured, logically
@@ -34,6 +40,38 @@ pytest -q                                # pure-logic tests run without a DB; ma
 ```bash
 docker compose up --build        # Postgres-with-pgvector + the app on http://localhost:8080
 ```
+The image is **multi-stage**: it compiles the React console with Vite and copies only the built
+`dist` into a lean Python runtime — no `node_modules`, and no pre-built artifact to commit.
+Open **http://localhost:8080** for the console; the API is under `/api/v1` and the OpenAPI docs at
+`/docs`. Host ports are overridable via `DI_APP_PORT` / `DI_DB_PORT` in a local `.env` if 8080/5433
+are taken on your machine.
+
+**Auth is on by default.** The compose stack seeds `DI_BOOTSTRAP_API_KEY` at startup; paste that key
+into the console's header bar (or send it as `X-API-KEY`). Set `AUTH_ENABLED=false` only for a
+throwaway local demo — it leaves every route open.
+
+### Where the raw document bytes live
+Pick a blob backend with `BLOB_BACKEND`; the pipeline, deletion and tenant-purge paths all work
+identically across the three:
+```bash
+docker compose up --build                  # postgres  — bytea in di_blob (default)
+BLOB_BACKEND=local docker compose up       # local     — a docker volume at /data/blobs
+docker compose --profile s3 up --build     # s3        — MinIO (console at :9001); use a real
+                                           #             bucket by setting S3_ENDPOINT/S3_BUCKET
+BLOB_BACKEND=none docker compose up        # none      — do not retain raw bytes at all
+```
+
+### Verify it end to end
+```bash
+python tools/smoke_test.py                 # 47 checks: auth, async ingest, masking, erasure, ...
+```
+
+### Ops surfaces
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Liveness only — the process is up |
+| `GET /readyz` | Per-dependency readiness (db, migrations, pgvector, retrieval, blob, ocr, auth); **503** when a required component is down |
+| `GET /metrics` | Prometheus: gate decisions, **LLM egress**, OCR engine, stage timings, ingest outcomes |
 The app applies migrations on startup and — because the compose DB ships pgvector — creates the
 `vector` extension, embedding columns, and HNSW indexes (the local Homebrew Postgres lacks
 pgvector, so a bare `pytest`/uvicorn run degrades to FTS-only search). Point at the real model

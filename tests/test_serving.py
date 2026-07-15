@@ -1,6 +1,8 @@
 """Unit tests for the serving layer (di.serving) — pure, no DB/network."""
 from __future__ import annotations
 
+from datetime import date
+
 from di import serving
 
 
@@ -97,3 +99,55 @@ def test_sensitivity_for_key():
     assert serving.sensitivity_for_key("identity.full_name") == "HIGH"
     assert serving.sensitivity_for_key("doc.issue_date") == "LOW"
     assert serving.sensitivity_for_key(None) == "LOW"
+
+
+def test_masking_redacts_date_and_num_not_just_text():
+    """A masked DOB must not leak via value_date (regression: UI showed `date: 1985-03-12`)."""
+    rows = [{
+        "attribute_key": "identity.date_of_birth", "resolved_value": "1985-03-12",
+        "value_date": date(1985, 3, 12), "value_num": None, "confidence": 0.9,
+        "conflict": False, "verification_status": "checksum_verified",
+    }, {
+        "attribute_key": "income.annual", "resolved_value": "250000",
+        "value_date": None, "value_num": 250000.0, "confidence": 0.9,
+        "conflict": False, "verification_status": "checksum_verified",
+    }]
+    out = serving.project_facts(rows, mask=True)
+    dob, income = out[0], out[1]
+    assert dob["masked"] is True
+    assert dob["value_date"] is None, "masked DOB leaked through value_date"
+    assert income["value_num"] is None, "masked income leaked through value_num"
+    # unmasked still carries the real values
+    clear = serving.project_facts(rows, mask=False)
+    assert clear[0]["value_date"] == date(1985, 3, 12)
+    assert clear[1]["value_num"] == 250000.0
+
+
+def test_masking_node_redacts_date_and_num():
+    """Same leak on the tree projection."""
+    rows = [{
+        "id": "n1", "parent_id": None, "node_type": "fact", "path": "a", "seq": 0, "depth": 1,
+        "attribute_key": "identity.date_of_birth", "value_text": "1985-03-12",
+        "value_date": date(1985, 3, 12), "value_num": 42.0, "sensitivity": "LOW",
+        "confidence": 0.9, "verification_status": "checksum_verified", "provenance": {},
+    }]
+    node = serving.nest_tree(rows, mask=True)[0]
+    assert node["masked"] is True
+    assert node["value_date"] is None and node["value_num"] is None
+
+
+def test_document_sensitivity_raises_gate_verdict_to_extracted_facts():
+    """A passport must not stay LOW just because the optional PII model never ran.
+
+    Regression: the lean container ships without [ml], so the gate scored every document LOW —
+    and a PASSPORT was stored as LOW sensitivity with its chunk text served unmasked.
+    """
+    assert serving.document_sensitivity("LOW", ["id.passport_number"]) == "CRITICAL"
+    assert serving.document_sensitivity("LOW", ["identity.surname"]) == "HIGH"
+    assert serving.document_sensitivity("LOW", ["doc.expiry_date"]) == "LOW"
+    # never downgrades the gate's own verdict
+    assert serving.document_sensitivity("CRITICAL", ["doc.expiry_date"]) == "CRITICAL"
+    assert serving.document_sensitivity("HIGH", []) == "HIGH"
+    # takes the max across a mixed set
+    assert serving.document_sensitivity(
+        "LOW", ["doc.expiry_date", "identity.surname", "id.passport_number"]) == "CRITICAL"

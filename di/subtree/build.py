@@ -36,6 +36,7 @@ from di.models import (
     NodeType,
     OcrResult,
     Provenance,
+    SensitivityBucket,
 )
 from di.subtree.chunk import chunk_text
 
@@ -79,6 +80,7 @@ def build_subtree(
     ocr: OcrResult,
     facts: list[ExtractedField],
     base_path: str,
+    doc_sensitivity: SensitivityBucket = SensitivityBucket.low,
 ) -> list[KNode]:
     """Assemble the in-memory knowledge subtree for one document version.
 
@@ -92,6 +94,11 @@ def build_subtree(
         facts: Extracted fields; one ``fact`` node is created per field under a ``facts`` section.
         base_path: The (already-sanitized) ltree path for the root document node, e.g.
             ``"client_42.doctype_us_passport.v1"``. Child labels are appended to it.
+        doc_sensitivity: The gate's document-level sensitivity, inherited by the structural and
+            content nodes (document/section/chunk). Their raw text quotes the very PII the fact
+            nodes redact — a chunk reading "Passport No: 123456789" under a masked fact node is
+            not masked at all — so they must carry the document's sensitivity, not the default.
+            Fact nodes keep their own, more specific per-field sensitivity.
 
     Returns:
         A flat list of :class:`~di.models.KNode`, root first, then sections/chunks, then facts.
@@ -121,6 +128,7 @@ def build_subtree(
             depth=nlevel(base_path),
             title=classification.doc_type or None,
             confidence=classification.confidence,
+            sensitivity=doc_sensitivity,
         )
     )
 
@@ -140,6 +148,7 @@ def build_subtree(
                 depth=nlevel(root.path) + 1,
                 title=f"page {page}" if page is not None else "body",
                 content=page_text or None,
+                sensitivity=doc_sensitivity,   # its text quotes the document's PII verbatim
                 provenance=_provenance(doc_id, version_id, page),
             )
         )
@@ -162,6 +171,7 @@ def build_subtree(
                     depth=nlevel(section.path) + 1,
                     content=chunk,
                     token_count=_estimate_tokens(chunk),
+                    sensitivity=doc_sensitivity,   # raw OCR text of a sensitive document
                     provenance=_provenance(doc_id, version_id, page),
                 )
             )

@@ -1,0 +1,25 @@
+{
+  "name": "document-intelligence-console",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "KYC document-intelligence console — React + Vite SPA served by FastAPI from frontend/dist.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.2"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^6.0.3",
+    "typescript": "^5.6.3",
+    "vite": "^8.1.4"
+  }
+}

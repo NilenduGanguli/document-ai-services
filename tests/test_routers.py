@@ -1,13 +1,22 @@
 """Router wiring tests — call the endpoint coroutines directly with monkeypatched store.
 
-No DB, no app startup, no network. Validates routing, serving integration, and the mask flag.
+No DB, no app startup, no network. Validates routing, serving integration, authorization and the
+mask flag. The endpoints now take an injected ``Principal``; calling them directly means passing
+one explicitly (FastAPI would otherwise resolve it from the X-API-KEY header).
 """
 from __future__ import annotations
 
 import pytest
+from fastapi import HTTPException
 
 from di import store
+from di.auth import Principal
 from di.routers import clients, nodes, search
+
+
+def _principal(client_ids: list[str] | None = None) -> Principal:
+    return Principal(key_id="test-key", name="test", client_ids=client_ids or ["*"],
+                     scopes=["*"])
 
 
 def _knode(nid, parent, ntype, **kw):
@@ -34,11 +43,20 @@ async def test_get_tree_nests_and_masks(monkeypatch):
         return rows
 
     monkeypatch.setattr(store, "fetch_subtree", fake_fetch_subtree)
-    res = await clients.get_tree("c1", mask=True)
-    assert res["count"] == 2
-    root = res["tree"][0]
+    res = await clients.get_tree("c1", mask=True, principal=_principal())
+    assert res.count == 2
+    assert res.masked is True
+    root = res.tree[0]
     fact = root["children"][0]
     assert fact["masked"] is True and fact["value_text"].endswith("4567")
+
+
+@pytest.mark.asyncio
+async def test_get_tree_denies_other_tenants(monkeypatch):
+    """A principal scoped to one client cannot read another's tree."""
+    with pytest.raises(HTTPException) as ei:
+        await clients.get_tree("other-client", principal=_principal(client_ids=["c1"]))
+    assert ei.value.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -46,14 +64,28 @@ async def test_get_facts_verified_only(monkeypatch):
     async def fake(client_id, *, attribute_key=None):
         return [
             {"attribute_key": "id.ssn", "resolved_value": "536-90-4399", "confidence": 0.95,
-             "conflict": False},
+             "conflict": False, "verification_status": "checksum_verified"},
             {"attribute_key": "income.employer", "resolved_value": "Acme", "confidence": 0.4,
-             "conflict": True},
+             "conflict": True, "verification_status": "llm_unverified"},
         ]
 
     monkeypatch.setattr(store, "fetch_merged_facts", fake)
-    res = await clients.get_facts("c1", verified_only=True)
-    assert res["count"] == 1 and res["facts"][0]["attribute_key"] == "id.ssn"
+    res = await clients.get_facts("c1", verified_only=True, mask=False, principal=_principal())
+    assert res.count == 1 and res.facts[0]["attribute_key"] == "id.ssn"
+
+
+@pytest.mark.asyncio
+async def test_get_facts_excludes_high_confidence_llm_fact(monkeypatch):
+    """A model's self-reported 0.95 must NOT satisfy verified_only — only real verification does."""
+    async def fake(client_id, *, attribute_key=None):
+        return [
+            {"attribute_key": "income.annual", "resolved_value": "250000", "confidence": 0.95,
+             "conflict": False, "verification_status": "llm_unverified"},
+        ]
+
+    monkeypatch.setattr(store, "fetch_merged_facts", fake)
+    res = await clients.get_facts("c1", verified_only=True, mask=False, principal=_principal())
+    assert res.count == 0
 
 
 @pytest.mark.asyncio
@@ -73,7 +105,7 @@ async def test_manifest(monkeypatch):
     monkeypatch.setattr(store, "get_document", fake_doc)
     monkeypatch.setattr(store, "fetch_subtree", fake_nodes)
     monkeypatch.setattr(store, "fetch_areps", fake_reps)
-    res = await clients.get_manifest("c1", "d1")
+    res = await clients.get_manifest("c1", "d1", principal=_principal())
     assert res["doc_type"] == "MX_INE" and res["answerable"] is True
     assert "id.curp" in res["attribute_keys"]
 
@@ -88,9 +120,10 @@ async def test_search_returns_ranked_hits(monkeypatch):
 
     monkeypatch.setattr(search, "pgvector_available", fake_pgvector)
     monkeypatch.setattr(store, "hybrid_search", fake_hybrid)
-    req = search.SearchRequest(query="passport", top_k=5)
-    res = await search.search("c1", req)
-    assert res["count"] == 1 and res["hits"][0]["_rank"] == 1
+    req = search.SearchRequest(query="passport", top_k=5, mask=False)
+    res = await search.search("c1", req, principal=_principal())
+    assert res.count == 1 and res.hits[0]["_rank"] == 1
+    assert res.vector is False
 
 
 @pytest.mark.asyncio
@@ -100,19 +133,17 @@ async def test_provenance(monkeypatch):
                       verification_status="checksum_verified", provenance={"page": 1})
 
     monkeypatch.setattr(store, "fetch_node", fake_node)
-    res = await nodes.get_provenance("n1", client_id="c1")
-    assert res["verification_status"] == "checksum_verified"
-    assert res["provenance"] == {"page": 1}
+    res = await nodes.get_provenance("n1", client_id="c1", principal=_principal())
+    assert res.verification_status == "checksum_verified"
+    assert res.provenance == {"page": 1}
 
 
 @pytest.mark.asyncio
 async def test_provenance_404(monkeypatch):
-    from fastapi import HTTPException
-
     async def fake_node(client_id, node_id):
         return None
 
     monkeypatch.setattr(store, "fetch_node", fake_node)
     with pytest.raises(HTTPException) as ei:
-        await nodes.get_provenance("missing", client_id="c1")
+        await nodes.get_provenance("missing", client_id="c1", principal=_principal())
     assert ei.value.status_code == 404

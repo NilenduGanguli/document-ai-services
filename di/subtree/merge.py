@@ -23,7 +23,7 @@ from datetime import date
 
 from pydantic import BaseModel
 
-from di.models import ClientFact
+from di.models import ClientFact, VerificationStatus
 
 
 class FactInput(BaseModel):
@@ -35,6 +35,21 @@ class FactInput(BaseModel):
     value_date: date | None = None
     value_num: float | None = None
     confidence: float = 0.0
+    #: How the source was verified (checksum/registry vs self-scored LLM). Carried to the winner so
+    #: the serving layer can distinguish "verified" from "the model said 0.9".
+    verification_status: VerificationStatus = VerificationStatus.unverified
+
+
+class Adjudication(BaseModel):
+    """A human decision that must survive every subsequent re-merge."""
+
+    attribute_key: str
+    verdict: str                       # accept | reject | override
+    value_text: str | None = None
+    value_date: date | None = None
+    value_num: float | None = None
+    reviewer: str | None = None
+    note: str | None = None
 
 
 def _comparable_key(f: FactInput) -> tuple[str | None, str | None, float | None]:
@@ -55,17 +70,24 @@ def _is_empty(comparable: tuple[str | None, str | None, float | None]) -> bool:
     return all(part is None for part in comparable)
 
 
-def merge_facts(facts: list[FactInput], client_id: str = "") -> list[ClientFact]:
+def merge_facts(facts: list[FactInput], client_id: str = "",
+                adjudications: dict[str, Adjudication] | None = None,
+                ontology_version: str | None = None) -> list[ClientFact]:
     """Collapse candidate facts into one resolved :class:`ClientFact` per attribute key.
 
     Args:
         facts: Candidate facts (any number, any mix of attribute keys).
         client_id: Optional client identifier stamped onto every resulting fact.
+        adjudications: Human decisions keyed by ``attribute_key``. These are applied *after*
+            automatic resolution and win outright, so a reviewer's correction is not silently
+            clobbered by the next ingest.
+        ontology_version: Stamped onto each fact so its vintage survives ontology changes.
 
     Returns:
         One :class:`ClientFact` per distinct ``attribute_key``, sorted by ``attribute_key`` for a
         stable, deterministic ordering.
     """
+    adjudications = adjudications or {}
     grouped: dict[str, list[FactInput]] = {}
     for f in facts:
         grouped.setdefault(f.attribute_key, []).append(f)
@@ -83,20 +105,61 @@ def merge_facts(facts: list[FactInput], client_id: str = "") -> list[ClientFact]
         }
         conflict = len(distinct_values) > 1
 
-        out.append(
-            ClientFact(
-                client_id=client_id,
-                attribute_key=attribute_key,
-                resolved_value=winner.value,
-                value_date=winner.value_date,
-                value_num=winner.value_num,
-                confidence=winner.confidence,
-                conflict=conflict,
-                needs_review=conflict,
-                source_fact_ids=[f.fact_id for f in group],
-            )
+        fact = ClientFact(
+            client_id=client_id,
+            attribute_key=attribute_key,
+            resolved_value=winner.value,
+            value_date=winner.value_date,
+            value_num=winner.value_num,
+            confidence=winner.confidence,
+            conflict=conflict,
+            needs_review=conflict,
+            source_fact_ids=[f.fact_id for f in group],
+            verification_status=winner.verification_status,
+            winning_fact_id=winner.fact_id,
+            ontology_version=ontology_version,
+            resolution_rationale={
+                "rule": "max_confidence",
+                "candidates": len(group),
+                "winner_confidence": winner.confidence,
+                "distinct_values": len(distinct_values),
+            },
         )
+        _apply_adjudication(fact, adjudications.get(attribute_key))
+        out.append(fact)
     return out
 
 
-__all__ = ["FactInput", "merge_facts"]
+def _apply_adjudication(fact: ClientFact, adj: Adjudication | None) -> None:
+    """Overlay a human decision onto an automatically-resolved fact (in place)."""
+    if adj is None:
+        return
+    fact.adjudicated = True
+    fact.resolution_rationale = {
+        **fact.resolution_rationale,
+        "adjudication": {"verdict": adj.verdict, "reviewer": adj.reviewer, "note": adj.note},
+    }
+    if adj.verdict == "override":
+        fact.resolved_value = adj.value_text
+        fact.value_date = adj.value_date
+        fact.value_num = adj.value_num
+        fact.verification_status = VerificationStatus.human_verified
+        fact.confidence = 1.0
+        fact.conflict = False
+        fact.needs_review = False
+    elif adj.verdict == "accept":
+        # The automatic winner was reviewed and confirmed: clear the review flag, keep the value.
+        fact.verification_status = VerificationStatus.human_verified
+        fact.conflict = False
+        fact.needs_review = False
+    elif adj.verdict == "reject":
+        # Reviewed and rejected: keep it visible but explicitly unresolved.
+        fact.resolved_value = None
+        fact.value_date = None
+        fact.value_num = None
+        fact.verification_status = VerificationStatus.unverified
+        fact.confidence = 0.0
+        fact.needs_review = True
+
+
+__all__ = ["Adjudication", "FactInput", "merge_facts"]

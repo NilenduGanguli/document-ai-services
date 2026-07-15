@@ -17,6 +17,7 @@ dependencies = [
     "httpx>=0.27",
     "sse-starlette>=2.0",
     "structlog>=24.1",
+    "prometheus-client>=0.20",   # /metrics exposition (gate decisions, LLM egress, stage timings)
     "python-stdnum>=1.20",   # CURP/RFC/SSN/SIN/EIN/PAN checksums
     "rapidfuzz>=3.6",        # label-anchored KV fuzzy matching
     "dateparser>=1.2",       # locale-aware date parsing
@@ -33,6 +34,10 @@ extract = [
     "pillow>=10.0",          # image loading for OCR
     "pytesseract>=0.3.10",   # Tesseract OCR bindings (PNG/JPEG, scanned PDFs) — needs the tesseract binary
     "pdf2image>=1.17",       # rasterize scanned PDFs for OCR — needs poppler
+]
+# S3 / MinIO blob backend (lazy-imported; only needed when BLOB_BACKEND=s3)
+s3 = [
+    "boto3>=1.34",
 ]
 # Local PII-safe classifier + PII gate (heavy; lazy-imported)
 ml = [
@@ -71,6 +76,7 @@ ignore = ["E501"]  # long lines tolerated in prompts/SQL
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
+    "integration: needs a live Postgres/S3; run with DI_RUN_INTEGRATION=1.",
     "db: requires a live Postgres (ltree).",
     "pgvector: requires pgvector extension (skipped if absent).",
     "ml: requires the optional [ml] dependency group.",

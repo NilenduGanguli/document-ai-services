@@ -181,3 +181,41 @@ def test_seq_orders_siblings() -> None:
     # sibling seqs are distinct and start at 0.
     seqs = sorted(s.seq for s in sections)
     assert seqs == list(range(len(sections)))
+
+
+def test_content_nodes_inherit_document_sensitivity():
+    """Chunk/section text quotes the document's PII verbatim, so it must carry its sensitivity.
+
+    Regression: with Mask PII on, the tree rendered a masked passport fact directly beneath a
+    chunk reading "Passport No: 123456789" in cleartext, because chunks defaulted to LOW.
+    """
+    ocr = OcrResult(engine="text", pages=1,
+                    text="PASSPORT Surname: SMITH Passport No: 123456789")
+    nodes = build_subtree(
+        client_id="c1", doc_id="d1", version_id="v1",
+        classification=Classification(doc_type="PASSPORT", confidence=0.9),
+        ocr=ocr, facts=[], base_path="c1.doctype_passport.v1",
+        doc_sensitivity=SensitivityBucket.critical,
+    )
+    content_nodes = [n for n in nodes if n.node_type.value in ("document", "section", "chunk")]
+    assert content_nodes, "expected structural nodes"
+    for n in content_nodes:
+        assert n.sensitivity == SensitivityBucket.critical, f"{n.node_type} kept {n.sensitivity}"
+
+
+def test_content_nodes_masked_end_to_end():
+    """With the document sensitivity propagated, the serving mask actually redacts chunk text."""
+    from di import serving
+
+    ocr = OcrResult(engine="text", pages=1, text="Passport No: 123456789 Surname: SMITH")
+    nodes = build_subtree(
+        client_id="c1", doc_id="d1", version_id="v1",
+        classification=Classification(doc_type="PASSPORT", confidence=0.9),
+        ocr=ocr, facts=[], base_path="c1.doctype_passport.v1",
+        doc_sensitivity=SensitivityBucket.critical,
+    )
+    rows = [n.model_dump(mode="json") for n in nodes]
+    masked = serving.project_nodes(rows, mask=True)
+    for row in masked:
+        if row.get("content"):
+            assert "123456789" not in row["content"], "raw PII survived masking"

@@ -12,6 +12,7 @@ Mirrors the conventions of the sibling ``retrieval`` backend without depending o
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -138,29 +139,98 @@ async def _create_hash_partitions(conn: asyncpg.Connection, table: str, n: int) 
         )
 
 
+def _lock_key(schema: str) -> int:
+    """Stable signed int64 advisory-lock key derived from the schema name."""
+    return int.from_bytes(hashlib.sha256(schema.encode()).digest()[:8], "big", signed=True)
+
+
+async def _ensure_ledger(conn: asyncpg.Connection, settings: Settings) -> None:
+    """Bootstrap the migration ledger itself (it cannot be created by a ledgered migration)."""
+    await conn.execute(
+        f'CREATE TABLE IF NOT EXISTS "{settings.pg_schema}".di_migration_ledger ('
+        " filename text PRIMARY KEY,"
+        " checksum text NOT NULL,"
+        " applied_at timestamptz NOT NULL DEFAULT now());"
+    )
+
+
+async def _applied_migrations(conn: asyncpg.Connection, settings: Settings) -> dict[str, str]:
+    rows = await conn.fetch(
+        f'SELECT filename, checksum FROM "{settings.pg_schema}".di_migration_ledger'
+    )
+    return {r["filename"]: r["checksum"] for r in rows}
+
+
+async def _assert_partition_count(conn: asyncpg.Connection, settings: Settings) -> None:
+    """A HASH partition count is frozen at first deploy: changing it silently corrupts routing.
+
+    Fail loudly on mismatch rather than letting ``CREATE TABLE ... FOR VALUES WITH (MODULUS n)``
+    produce overlap errors (increase) or leave orphaned rows unreachable (decrease).
+    """
+    for table in _PARTITIONED_TABLES:
+        live = await conn.fetchval(
+            "SELECT count(*) FROM pg_inherits i "
+            "JOIN pg_class p ON p.oid = i.inhparent "
+            "JOIN pg_namespace n ON n.oid = p.relnamespace "
+            "WHERE n.nspname = $1 AND p.relname = $2",
+            settings.pg_schema, table,
+        )
+        if live and int(live) != settings.pg_hash_partitions:
+            raise RuntimeError(
+                f'{table} already has {live} hash partitions but PG_HASH_PARTITIONS='
+                f"{settings.pg_hash_partitions}. The partition count is immutable after the first "
+                f"deploy — set PG_HASH_PARTITIONS={live} or migrate the data deliberately."
+            )
+
+
 async def run_migrations(settings: Settings | None = None) -> None:
-    """Create the schema, apply every ``NNN_*.sql`` in order, build hash partitions, and
-    (when pgvector is present) add embedding columns + HNSW indexes. Idempotent."""
+    """Apply every ``NNN_*.sql`` once, build hash partitions, and (with pgvector) add embedding
+    columns + HNSW indexes.
+
+    A session advisory lock serializes concurrent replicas so a rolling deploy cannot race DDL,
+    and a checksum ledger records what has actually been applied (files whose checksum already
+    matches are skipped, making non-idempotent migrations possible in future).
+    """
     settings = settings or get_settings()
     pool = await init_pool(settings)
     async with pool.acquire() as conn:
         await conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{settings.pg_schema}";')
         await _init_conn(conn)
-        await _try_enable_pgvector(conn)
+        lock_key = _lock_key(settings.pg_schema)
+        await conn.execute("SELECT pg_advisory_lock($1)", lock_key)
+        try:
+            await _try_enable_pgvector(conn)
+            await _ensure_ledger(conn, settings)
+            applied = await _applied_migrations(conn, settings)
 
-        for path in sorted(_MIGRATIONS_DIR.glob("*.sql")):
-            sql = path.read_text(encoding="utf-8").replace("__SCHEMA__", f'"{settings.pg_schema}"')
-            try:
-                await conn.execute(sql)
+            for path in sorted(_MIGRATIONS_DIR.glob("*.sql")):
+                raw = path.read_text(encoding="utf-8")
+                checksum = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                if applied.get(path.name) == checksum:
+                    logger.debug("migration %s already applied", path.name)
+                    continue
+                sql = raw.replace("__SCHEMA__", f'"{settings.pg_schema}"')
+                try:
+                    await conn.execute(sql)
+                except Exception:
+                    logger.exception("migration %s failed", path.name)
+                    raise
+                await conn.execute(
+                    f'INSERT INTO "{settings.pg_schema}".di_migration_ledger '
+                    "(filename, checksum) VALUES ($1,$2) "
+                    "ON CONFLICT (filename) DO UPDATE SET checksum = EXCLUDED.checksum, "
+                    "applied_at = now()",
+                    path.name, checksum,
+                )
                 logger.info("applied migration %s", path.name)
-            except Exception:
-                logger.exception("migration %s failed", path.name)
-                raise
 
-        for table in _PARTITIONED_TABLES:
-            await _create_hash_partitions(conn, table, settings.pg_hash_partitions)
+            await _assert_partition_count(conn, settings)
+            for table in _PARTITIONED_TABLES:
+                await _create_hash_partitions(conn, table, settings.pg_hash_partitions)
 
-        await _ensure_vector_columns(conn, settings)
+            await _ensure_vector_columns(conn, settings)
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock($1)", lock_key)
 
 
 async def _try_enable_pgvector(conn: asyncpg.Connection) -> None:

@@ -40,8 +40,17 @@ class RepType(StrEnum):
 class VerificationStatus(StrEnum):
     checksum_verified = "checksum_verified"   # deterministic ID passed its checksum
     gov_verified = "gov_verified"             # confirmed against a government endpoint (e.g. SAT)
+    human_verified = "human_verified"         # a reviewer adjudicated the value (highest trust)
     llm_unverified = "llm_unverified"         # extracted by the LLM, not independently verified
     unverified = "unverified"
+
+
+#: Statuses that represent independent verification — i.e. NOT a model's self-reported score.
+TRUSTED_VERIFICATION = frozenset({
+    VerificationStatus.checksum_verified,
+    VerificationStatus.gov_verified,
+    VerificationStatus.human_verified,
+})
 
 
 class SensitivityBucket(StrEnum):
@@ -216,6 +225,15 @@ class ClientFact(BaseModel):
     conflict: bool = False
     needs_review: bool = False
     source_fact_ids: list[str] = Field(default_factory=list)
+    #: Verification of the *winning* source. Carried through the merge so downstream cannot mistake
+    #: a self-scored LLM extraction for a checksum-verified one.
+    verification_status: VerificationStatus = VerificationStatus.unverified
+    #: Which contributing fact won, and why — evidence for audit/lineage.
+    winning_fact_id: str | None = None
+    resolution_rationale: dict[str, Any] = Field(default_factory=dict)
+    ontology_version: str | None = None
+    #: True when a human adjudication overrode the automatic resolution.
+    adjudicated: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +243,13 @@ class DocumentMeta(BaseModel):
     id: str | None = None
     client_id: str
     document_name: str
+    #: Caller-supplied logical identity. Preferred over ``document_name`` as the document key so a
+    #: source system that uploads every scan as "scan001.pdf" does not silently supersede itself.
+    external_document_id: str | None = None
     s3_uri: str | None = None
+    #: Where the raw bytes were retained (blob backend URI + backend name), if retained at all.
+    blob_uri: str | None = None
+    blob_backend: str | None = None
     sha256: str | None = None
     mime: str | None = None
     doc_type: str | None = None

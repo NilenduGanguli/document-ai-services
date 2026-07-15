@@ -7,11 +7,13 @@ Kept dependency-free so it is trivially unit-testable.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable
 from typing import Any
 
-from di.models import RepType, SensitivityBucket
+from di.models import TRUSTED_VERIFICATION, RepType, SensitivityBucket, VerificationStatus
 
 _MASKABLE = {SensitivityBucket.high.value, SensitivityBucket.critical.value}
+_TRUSTED_VALUES = {v.value for v in TRUSTED_VERIFICATION}
 
 # Fields surfaced per node in the API tree.
 _NODE_FIELDS = (
@@ -50,8 +52,12 @@ def _project_node(row: dict[str, Any], *, mask: bool) -> dict[str, Any]:
     eff = _effective_sensitivity(row)
     out["sensitivity"] = eff  # surfaced pill matches the masking decision
     if mask and eff in _MASKABLE:
-        # Mask only the sensitive payload; structure, provenance, type, confidence stay intact.
+        # Mask every representation of the value, not just the text one. A redacted DOB whose
+        # value_date still reads 1985-03-12 is not redacted at all; same for value_num.
+        # Structure, provenance, type and confidence stay intact.
         out["value_text"] = _redact(out.get("value_text"))
+        out["value_date"] = None
+        out["value_num"] = None
         if out.get("content"):
             out["content"] = "[REDACTED]"
         out["masked"] = True
@@ -91,13 +97,31 @@ def nest_tree(rows: list[dict[str, Any]], *, mask: bool = False) -> list[dict[st
     return roots
 
 
+def is_verified(row: dict[str, Any]) -> bool:
+    """Whether a fact is *independently* verified — not merely self-scored by a model.
+
+    A model reporting confidence 0.9 on a hallucinated income figure must never satisfy
+    ``verified_only``: trust requires a checksum, a government registry, or a human reviewer.
+    Facts whose verification_status is unknown (pre-migration rows) fall back to the old
+    confidence heuristic so historical data keeps a sensible, conservative answer.
+    """
+    if row.get("conflict"):
+        return False
+    status = row.get("verification_status")
+    if status is None:
+        return float(row.get("confidence") or 0.0) >= 0.8
+    if status == VerificationStatus.llm_unverified.value:
+        return False
+    return str(status) in _TRUSTED_VALUES
+
+
 def project_facts(rows: list[dict[str, Any]], *, mask: bool = False,
                   verified_only: bool = False) -> list[dict[str, Any]]:
     """Project merged-fact rows, deriving sensitivity (from the attribute key) and a 'verified'
-    flag (high confidence + no conflict); optionally filter to verified and/or mask values."""
+    flag (independent verification + no conflict); optionally filter and/or mask values."""
     out: list[dict[str, Any]] = []
     for row in rows:
-        verified = float(row.get("confidence") or 0.0) >= 0.8 and not row.get("conflict")
+        verified = is_verified(row)
         if verified_only and not verified:
             continue
         item = dict(row)
@@ -105,7 +129,11 @@ def project_facts(rows: list[dict[str, Any]], *, mask: bool = False,
         sensitivity = sensitivity_for_key(row.get("attribute_key"))
         item["sensitivity"] = sensitivity
         if mask and sensitivity in _MASKABLE:
+            # Redact every representation: a masked resolved_value beside a cleartext
+            # value_date/value_num would leak the very thing being masked.
             item["resolved_value"] = _redact(item.get("resolved_value"))
+            item["value_date"] = None
+            item["value_num"] = None
             item["masked"] = True
         out.append(item)
     return out
@@ -119,6 +147,24 @@ def sensitivity_for_key(attribute_key: str | None) -> str:
     if key.startswith(("identity.", "address.", "income.", "account.")):
         return SensitivityBucket.high.value
     return SensitivityBucket.low.value
+
+
+def document_sensitivity(gate_sensitivity: str, attribute_keys: Iterable[str | None]) -> str:
+    """The gate's verdict, raised to the level implied by what was actually extracted.
+
+    The gate derives sensitivity from detected PII entities, which requires the optional [ml]
+    stack; where it is absent (the lean container image is built without it) every document —
+    including a passport — comes back LOW. But if a deterministic extractor pulled
+    ``id.passport_number`` out of it, the document is self-evidently CRITICAL regardless of
+    whether a PII model ran. Taking the max keeps the document's sensitivity honest, which in
+    turn drives what the masking projection redacts.
+    """
+    best = str(gate_sensitivity or SensitivityBucket.low.value)
+    for key in attribute_keys:
+        implied = sensitivity_for_key(key)
+        if _SENS_ORDER.get(implied, 0) > _SENS_ORDER.get(best, 0):
+            best = implied
+    return best
 
 
 def project_nodes(rows: list[dict[str, Any]], *, mask: bool = False) -> list[dict[str, Any]]:

@@ -1,11 +1,30 @@
+# Keep the build context small and never ship local artifacts into the image.
+# NOTE: frontend/node_modules and frontend/dist are excluded on purpose — the image builds the UI
+# from source in the `frontend` stage, so a stale local build can never leak into the container.
 .venv/
 .git/
+.github/
 __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.coverage
+htmlcov/
 .env
 tests/
 uploads/
 *.egg-info/
+**/node_modules
+frontend/dist
+docs/pdf
+presentation
+reports
+samples/generated
+.minio-data/
+models_cache/
+*.joblib
+*.pkl
+*.pem
+*.key
+.DS_Store

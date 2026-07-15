@@ -8,7 +8,9 @@ fuses the legs with Reciprocal Rank Fusion.
 """
 from __future__ import annotations
 
+import base64
 import uuid
+from datetime import datetime
 from typing import Any
 
 from di.config import get_settings
@@ -37,14 +39,70 @@ def _new_id(existing: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Keyset pagination
+# ---------------------------------------------------------------------------
+def encode_cursor(created_at: datetime, row_id: str) -> str:
+    """Opaque cursor for keyset pagination over (created_at DESC, id DESC)."""
+    raw = f"{created_at.isoformat()}|{row_id}"
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def decode_cursor(cursor: str) -> tuple[datetime, str]:
+    """Inverse of :func:`encode_cursor`. Raises ValueError on a malformed cursor."""
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode()).decode()
+        ts, sep, row_id = raw.partition("|")
+        if not sep or not row_id:
+            raise ValueError("missing separator")
+        return datetime.fromisoformat(ts), row_id
+    except Exception as exc:  # noqa: BLE001 - normalize every decode failure to ValueError
+        raise ValueError(f"malformed cursor: {cursor!r}") from exc
+
+
+def clamp_limit(limit: int | None) -> int:
+    """Clamp a caller-supplied page size into [1, max_page_size]."""
+    settings = get_settings()
+    if limit is None:
+        return settings.default_page_size
+    return max(1, min(int(limit), settings.max_page_size))
+
+
+def _paginate(rows: list[dict[str, Any]], limit: int,
+              ) -> tuple[list[dict[str, Any]], str | None]:
+    """Trim an over-fetched page (limit+1) and derive the next cursor."""
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    if not (has_more and page):
+        return page, None
+    last = page[-1]
+    return page, encode_cursor(last["created_at"], str(last["id"]))
+
+
+# ---------------------------------------------------------------------------
 # Documents & versions
 # ---------------------------------------------------------------------------
-async def find_document(client_id: str, document_name: str) -> dict[str, Any] | None:
+async def find_document(client_id: str, document_name: str,
+                        external_document_id: str | None = None) -> dict[str, Any] | None:
+    """Resolve a logical document.
+
+    ``external_document_id`` is the caller's own identity for the document and takes precedence:
+    a source system that names every scan ``scan001.pdf`` would otherwise have each upload
+    silently supersede an unrelated document.
+    """
     s = _schema()
     async with acquire(client_id) as conn:
+        if external_document_id:
+            row = await conn.fetchrow(
+                f'SELECT * FROM "{s}".di_documents '
+                "WHERE client_id = $1 AND external_document_id = $2 AND deleted_at IS NULL",
+                client_id, external_document_id,
+            )
+            return dict(row) if row else None
         row = await conn.fetchrow(
             f'SELECT * FROM "{s}".di_documents '
-            "WHERE client_id = $1 AND document_name = $2 AND deleted_at IS NULL",
+            "WHERE client_id = $1 AND document_name = $2 AND external_document_id IS NULL "
+            "AND deleted_at IS NULL",
             client_id, document_name,
         )
         return dict(row) if row else None
@@ -53,27 +111,41 @@ async def find_document(client_id: str, document_name: str) -> dict[str, Any] | 
 async def insert_document(meta: DocumentMeta, *, ocr_text: str | None = None,
                           ocr_lines: list[dict] | None = None,
                           lang_profile: dict | None = None) -> str:
-    """Insert (or UPSERT by client_id+document_name) a document row; returns its id."""
+    """Insert (or UPSERT) a document row; returns its id.
+
+    The conflict target is (client_id, document_name) when no ``external_document_id`` is given,
+    and (client_id, external_document_id) when one is — so the caller's identity wins.
+    """
     s = _schema()
     doc_id = _new_id(meta.id)
+    updates = (
+        " s3_uri=EXCLUDED.s3_uri, sha256=EXCLUDED.sha256, mime=EXCLUDED.mime, "
+        " doc_type=EXCLUDED.doc_type, doc_category=EXCLUDED.doc_category, subject=EXCLUDED.subject, "
+        " jurisdiction=EXCLUDED.jurisdiction, lang_profile=EXCLUDED.lang_profile, "
+        " sensitivity_bucket=EXCLUDED.sensitivity_bucket, gate_decision=EXCLUDED.gate_decision, "
+        " confidence=EXCLUDED.confidence, ocr_engine=EXCLUDED.ocr_engine, "
+        " page_count=EXCLUDED.page_count, ocr_text=EXCLUDED.ocr_text, ocr_lines=EXCLUDED.ocr_lines, "
+        " blob_uri=EXCLUDED.blob_uri, blob_backend=EXCLUDED.blob_backend, "
+        " document_name=EXCLUDED.document_name, updated_at=now(), deleted_at=NULL "
+    )
+    target = (
+        "(client_id, external_document_id) WHERE external_document_id IS NOT NULL"
+        if meta.external_document_id
+        else "(client_id, document_name)"
+    )
     async with acquire(meta.client_id) as conn:
         row = await conn.fetchrow(
             f'INSERT INTO "{s}".di_documents '
-            "(id, client_id, document_name, s3_uri, sha256, mime, doc_type, doc_category, subject, "
-            " jurisdiction, lang_profile, sensitivity_bucket, gate_decision, confidence, ocr_engine, "
-            " page_count, ocr_text, ocr_lines) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) "
-            "ON CONFLICT (client_id, document_name) DO UPDATE SET "
-            " s3_uri=EXCLUDED.s3_uri, sha256=EXCLUDED.sha256, mime=EXCLUDED.mime, "
-            " doc_type=EXCLUDED.doc_type, doc_category=EXCLUDED.doc_category, subject=EXCLUDED.subject, "
-            " jurisdiction=EXCLUDED.jurisdiction, lang_profile=EXCLUDED.lang_profile, "
-            " sensitivity_bucket=EXCLUDED.sensitivity_bucket, gate_decision=EXCLUDED.gate_decision, "
-            " confidence=EXCLUDED.confidence, ocr_engine=EXCLUDED.ocr_engine, "
-            " page_count=EXCLUDED.page_count, ocr_text=EXCLUDED.ocr_text, ocr_lines=EXCLUDED.ocr_lines, "
-            " updated_at=now(), deleted_at=NULL "
+            "(id, client_id, document_name, external_document_id, s3_uri, blob_uri, blob_backend, "
+            " sha256, mime, doc_type, doc_category, subject, jurisdiction, lang_profile, "
+            " sensitivity_bucket, gate_decision, confidence, ocr_engine, page_count, ocr_text, "
+            " ocr_lines) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) "
+            f"ON CONFLICT {target} DO UPDATE SET {updates}"
             "RETURNING id",
-            doc_id, meta.client_id, meta.document_name, meta.s3_uri, meta.sha256, meta.mime,
-            meta.doc_type, meta.doc_category, meta.subject, meta.jurisdiction, lang_profile or {},
+            doc_id, meta.client_id, meta.document_name, meta.external_document_id, meta.s3_uri,
+            meta.blob_uri, meta.blob_backend, meta.sha256, meta.mime, meta.doc_type,
+            meta.doc_category, meta.subject, meta.jurisdiction, lang_profile or {},
             meta.sensitivity_bucket.value, meta.gate_decision.value if meta.gate_decision else None,
             meta.confidence, meta.ocr_engine, meta.page_count, ocr_text, ocr_lines or [],
         )
@@ -178,6 +250,7 @@ async def insert_areps(reps: list[ARep]) -> None:
 
 
 async def upsert_merged_facts(facts: list[ClientFact]) -> None:
+    """Persist the merged client view, including the winner's verification + resolution evidence."""
     if not facts:
         return
     s = _schema()
@@ -185,16 +258,55 @@ async def upsert_merged_facts(facts: list[ClientFact]) -> None:
         await conn.executemany(
             f'INSERT INTO "{s}".client_merged_fact '
             "(id, client_id, attribute_key, resolved_value, value_date, value_num, confidence, "
-            " conflict, needs_review, source_fact_ids) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) "
+            " conflict, needs_review, source_fact_ids, verification_status, winning_fact_id, "
+            " resolution_rationale, ontology_version, adjudicated) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) "
             "ON CONFLICT (client_id, attribute_key) DO UPDATE SET "
             " resolved_value=EXCLUDED.resolved_value, value_date=EXCLUDED.value_date, "
             " value_num=EXCLUDED.value_num, confidence=EXCLUDED.confidence, "
             " conflict=EXCLUDED.conflict, needs_review=EXCLUDED.needs_review, "
-            " source_fact_ids=EXCLUDED.source_fact_ids, updated_at=now()",
+            " source_fact_ids=EXCLUDED.source_fact_ids, "
+            " verification_status=EXCLUDED.verification_status, "
+            " winning_fact_id=EXCLUDED.winning_fact_id, "
+            " resolution_rationale=EXCLUDED.resolution_rationale, "
+            " ontology_version=EXCLUDED.ontology_version, adjudicated=EXCLUDED.adjudicated, "
+            " updated_at=now()",
             [(str(uuid.uuid4()), f.client_id, f.attribute_key, f.resolved_value, f.value_date,
               f.value_num, f.confidence, f.conflict, f.needs_review,
-              [uuid.UUID(x) for x in f.source_fact_ids]) for f in facts],
+              [uuid.UUID(x) for x in f.source_fact_ids],
+              f.verification_status.value if f.verification_status else None,
+              uuid.UUID(f.winning_fact_id) if f.winning_fact_id else None,
+              f.resolution_rationale or {}, f.ontology_version, f.adjudicated) for f in facts],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Human adjudication (survives re-merge)
+# ---------------------------------------------------------------------------
+async def fetch_adjudications(client_id: str) -> list[dict[str, Any]]:
+    s = _schema()
+    async with acquire(client_id) as conn:
+        return [dict(r) for r in await conn.fetch(
+            f'SELECT * FROM "{s}".di_fact_adjudication WHERE client_id = $1', client_id)]
+
+
+async def upsert_adjudication(client_id: str, *, attribute_key: str, verdict: str,
+                              value_text: str | None = None, value_date: Any = None,
+                              value_num: float | None = None, reviewer: str | None = None,
+                              note: str | None = None) -> None:
+    """Record a reviewer's decision for an attribute. Re-merge reapplies it, so it is not lost."""
+    s = _schema()
+    async with acquire(client_id) as conn:
+        await conn.execute(
+            f'INSERT INTO "{s}".di_fact_adjudication '
+            "(id, client_id, attribute_key, verdict, value_text, value_date, value_num, reviewer, "
+            " note) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) "
+            "ON CONFLICT (client_id, attribute_key) DO UPDATE SET "
+            " verdict=EXCLUDED.verdict, value_text=EXCLUDED.value_text, "
+            " value_date=EXCLUDED.value_date, value_num=EXCLUDED.value_num, "
+            " reviewer=EXCLUDED.reviewer, note=EXCLUDED.note, created_at=now()",
+            str(uuid.uuid4()), client_id, attribute_key, verdict, value_text, value_date,
+            value_num, reviewer, note,
         )
 
 
@@ -238,12 +350,51 @@ async def fetch_node(client_id: str, node_id: str) -> dict[str, Any] | None:
         return dict(row) if row else None
 
 
-async def list_documents(client_id: str) -> list[dict[str, Any]]:
+#: Columns returned by the document LIST endpoint. Deliberately excludes ocr_text / ocr_lines:
+#: shipping every page's raw OCR (and its PII) in a list response is both a payload and a
+#: disclosure problem. Fetch a single document to get the full OCR payload.
+_DOC_LIST_COLS = (
+    "id, client_id, document_name, external_document_id, doc_type, doc_category, subject, "
+    "jurisdiction, sensitivity_bucket, gate_decision, confidence, ocr_engine, page_count, "
+    "sha256, mime, blob_backend, created_at, updated_at"
+)
+
+
+async def list_documents(client_id: str, *, limit: int = 50, cursor: str | None = None,
+                         ) -> tuple[list[dict[str, Any]], str | None]:
+    """Keyset-paginated document list. Cursor is an opaque "created_at|id"."""
     s = _schema()
+    conds = ["client_id = $1", "deleted_at IS NULL"]
+    params: list[Any] = [client_id]
+    if cursor:
+        created_at, cid = decode_cursor(cursor)
+        params.extend([created_at, cid])
+        conds.append(f"(created_at, id) < (${len(params) - 1}::timestamptz, ${len(params)}::uuid)")
+    sql = (f"SELECT {_DOC_LIST_COLS} FROM \"{s}\".di_documents WHERE " + " AND ".join(conds)
+           + f" ORDER BY created_at DESC, id DESC LIMIT {int(limit) + 1}")
     async with acquire(client_id) as conn:
-        return [dict(r) for r in await conn.fetch(
-            f'SELECT * FROM "{s}".di_documents WHERE client_id = $1 AND deleted_at IS NULL '
-            "ORDER BY created_at DESC", client_id)]
+        rows = [dict(r) for r in await conn.fetch(sql, *params)]
+    return _paginate(rows, limit)
+
+
+async def fetch_client_facts(client_id: str) -> list[dict[str, Any]]:
+    """Fetch only the current *fact* nodes, with the narrow column set the merge needs.
+
+    The merge previously pulled the client's entire subtree (``SELECT *`` over every knode,
+    hauling content, tsvectors and embeddings) on every ingest, so cost scaled with tenant size
+    rather than document size. The ``knode_attr`` partial index serves this predicate directly.
+    """
+    s = _schema()
+    sql = (
+        "SELECT k.id, k.attribute_key, k.value_text, k.value_date, k.value_num, k.confidence, "
+        "       k.verification_status "
+        f'FROM "{s}".knode k '
+        "WHERE k.client_id = $1 AND k.deleted_at IS NULL "
+        "  AND k.node_type = 'fact' AND k.attribute_key IS NOT NULL "
+        f"  AND {_current_clause(s)}"
+    )
+    async with acquire(client_id) as conn:
+        return [dict(r) for r in await conn.fetch(sql, client_id)]
 
 
 async def get_document(client_id: str, doc_id: str) -> dict[str, Any] | None:
@@ -288,32 +439,93 @@ async def fetch_areps(client_id: str, *, doc_id: str | None = None, knode_id: st
 
 
 async def list_version_changes(client_id: str, *, since: str | None = None,
-                               ) -> list[dict[str, Any]]:
-    """Version delta feed: versions (optionally created since a timestamp) + changed_fields."""
+                               after_seq: int | None = None, limit: int = 50,
+                               ) -> tuple[list[dict[str, Any]], int | None]:
+    """Version delta feed.
+
+    ``after_seq`` is the preferred cursor: ``change_seq`` is a monotonic sequence, so a consumer
+    can resume exactly where it stopped. ``since`` (a timestamp) is retained for compatibility but
+    is inclusive (``>=``) and therefore re-delivers rows sharing a boundary timestamp.
+    Returns (rows, next_seq) where next_seq is the highest change_seq in the page.
+    """
     s = _schema()
     sql = (f'SELECT v.*, d.document_name, d.doc_type FROM "{s}".doc_version v '
            f'JOIN "{s}".di_documents d ON d.id = v.doc_id AND d.client_id = v.client_id '
            "WHERE v.client_id = $1")
     params: list[Any] = [client_id]
-    if since:
+    if after_seq is not None:
+        params.append(after_seq)
+        sql += f" AND v.change_seq > ${len(params)}"
+    elif since:
         params.append(since)
         sql += f" AND v.created_at >= ${len(params)}::timestamptz"
-    sql += " ORDER BY v.created_at DESC"
+    order = "v.change_seq ASC" if after_seq is not None else "v.created_at DESC"
+    sql += f" ORDER BY {order} LIMIT {int(limit)}"
     async with acquire(client_id) as conn:
-        return [dict(r) for r in await conn.fetch(sql, *params)]
+        rows = [dict(r) for r in await conn.fetch(sql, *params)]
+    seqs = [r["change_seq"] for r in rows if r.get("change_seq") is not None]
+    return rows, (max(seqs) if seqs else None)
 
 
 async def record_decision_trace(client_id: str, doc_id: str | None, gate: GateResult) -> None:
+    """Persist the per-document gate audit row, including *why* it was routed that way."""
     s = _schema()
+    anchor_summary = {
+        "signals": list(gate.classification.signals or []),
+        "confidence": gate.classification.confidence,
+        "pii_types": sorted({e.entity_type for e in gate.pii_entities}),
+    }
     async with acquire(client_id) as conn:
         await conn.execute(
             f'INSERT INTO "{s}".di_decision_trace '
             "(id, client_id, doc_id, classification, pii_entities, sensitivity, gate_decision, "
-            " lang_profile) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            " lang_profile, rationale, anchor_summary) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
             str(uuid.uuid4()), client_id, doc_id, gate.classification.model_dump(mode="json"),
             [e.model_dump(mode="json") for e in gate.pii_entities], gate.sensitivity.value,
             gate.decision.value, gate.lang_profile.model_dump(mode="json"),
+            gate.rationale or None, anchor_summary,
         )
+
+
+# ---------------------------------------------------------------------------
+# Deletion / erasure (retention, right-to-erasure, tenant off-boarding)
+# ---------------------------------------------------------------------------
+async def delete_document(client_id: str, doc_id: str) -> dict[str, int]:
+    """Hard-delete one document and everything derived from it.
+
+    Only ``doc_version`` cascades from ``di_documents``; knode/arep/decision-trace rows must be
+    removed explicitly. The merged client view is recomputed by the caller afterwards, since
+    ``client_merged_fact.source_fact_ids`` has no FK to cascade through.
+    """
+    s = _schema()
+    counts: dict[str, int] = {}
+    async with acquire(client_id) as conn:
+        async with conn.transaction():
+            for table in ("arep", "knode", "di_decision_trace"):
+                res = await conn.execute(
+                    f'DELETE FROM "{s}".{table} WHERE client_id = $1 AND doc_id = $2',
+                    client_id, doc_id)
+                counts[table] = int(res.split()[-1]) if res else 0
+            res = await conn.execute(
+                f'DELETE FROM "{s}".di_documents WHERE client_id = $1 AND id = $2',
+                client_id, doc_id)  # doc_version cascades
+            counts["di_documents"] = int(res.split()[-1]) if res else 0
+    return counts
+
+
+async def purge_client(client_id: str) -> dict[str, int]:
+    """Erase every trace of a tenant (off-boarding / right-to-erasure). Irreversible."""
+    s = _schema()
+    tables = ("arep", "knode", "doc_version", "client_merged_fact", "di_fact_adjudication",
+              "di_decision_trace", "di_entity", "di_job", "di_blob", "di_documents")
+    counts: dict[str, int] = {}
+    async with acquire(client_id) as conn:
+        async with conn.transaction():
+            for table in tables:
+                res = await conn.execute(
+                    f'DELETE FROM "{s}".{table} WHERE client_id = $1', client_id)
+                counts[table] = int(res.split()[-1]) if res else 0
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +621,10 @@ async def hybrid_search(client_id: str, *, query_text: str, query_embedding: lis
 
 # expose for callers that need the live dim
 __all__ = [
-    "find_document", "insert_document", "get_current_version", "create_version",
-    "insert_knodes", "insert_areps", "upsert_merged_facts", "fetch_subtree", "fetch_node",
-    "list_documents", "record_decision_trace", "hybrid_search", "embedding_dim",
+    "clamp_limit", "create_version", "decode_cursor", "delete_document", "embedding_dim",
+    "encode_cursor", "fetch_adjudications", "fetch_areps", "fetch_client_facts",
+    "fetch_merged_facts", "fetch_node", "fetch_subtree", "find_document", "get_current_version",
+    "get_document", "hybrid_search", "insert_areps", "insert_document", "insert_knodes",
+    "list_documents", "list_version_changes", "purge_client", "record_decision_trace",
+    "upsert_adjudication", "upsert_merged_facts",
 ]

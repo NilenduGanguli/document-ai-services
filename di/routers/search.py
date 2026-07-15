@@ -1,15 +1,20 @@
 """Search router — hybrid (dense + lexical + structural) retrieval scoped to a client.
 
 Embeds the query through the retrieval gateway (when pgvector is available), runs the
-index-many/return-parent hybrid search, and returns ranked knode hits with grounding. Honors the
-toggleable masking projection.
+index-many/return-parent hybrid search, and returns ranked knode hits with grounding. ``top_k`` is
+bounded and masking follows the server-side policy by default.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter
-from pydantic import BaseModel
+import time
+from typing import Any
 
-from di import serving, store
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
+
+from di import observability, serving, store
+from di.auth import Principal, authorize_client, require_principal
+from di.config import get_settings
 from di.db import pgvector_available
 from di.retrieval_client import get_retrieval_client
 
@@ -17,16 +22,35 @@ router = APIRouter(prefix="/api/v1", tags=["search"])
 
 
 class SearchRequest(BaseModel):
-    query: str
+    query: str = Field(..., min_length=1, max_length=2000)
     scope_path: str | None = None
     doc_id: str | None = None
-    top_k: int = 20
+    top_k: int = Field(20, ge=1, le=100)
     current_only: bool = True
-    mask: bool = False
+    mask: bool | None = None
 
 
-@router.post("/clients/{client_id}/search")
-async def search(client_id: str, req: SearchRequest) -> dict:
+class SearchResponse(BaseModel):
+    client_id: str
+    query: str
+    count: int
+    masked: bool
+    vector: bool = Field(..., description="False when pgvector is absent (lexical-only results)")
+    hits: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@router.post("/clients/{client_id}/search", response_model=SearchResponse)
+async def search(
+    client_id: str, req: SearchRequest,
+    principal: Principal = Depends(require_principal),  # noqa: B008
+) -> SearchResponse:
+    """Hybrid search across a client's knowledge, grounded in source documents."""
+    authorize_client(principal, client_id)
+    settings = get_settings()
+    masked = settings.mask_by_default if req.mask is None else req.mask
+    top_k = min(req.top_k, settings.max_top_k)
+    started = time.perf_counter()
+
     query_embedding = None
     if await pgvector_available():
         client = get_retrieval_client()
@@ -40,10 +64,12 @@ async def search(client_id: str, req: SearchRequest) -> dict:
 
     hits = await store.hybrid_search(
         client_id, query_text=req.query, query_embedding=query_embedding,
-        scope_path=req.scope_path, doc_id=req.doc_id, top_k=req.top_k,
+        scope_path=req.scope_path, doc_id=req.doc_id, top_k=top_k,
         current_only=req.current_only)
-    return {"client_id": client_id, "query": req.query, "count": len(hits),
-            "hits": serving.project_nodes(hits, mask=req.mask)}
+    observability.observe_search(time.perf_counter() - started)
+    return SearchResponse(client_id=client_id, query=req.query, count=len(hits), masked=masked,
+                          vector=query_embedding is not None,
+                          hits=serving.project_nodes(hits, mask=masked))
 
 
 @router.get("/search/health")

@@ -11,8 +11,10 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
+import anyio
+
 import di.extract.deterministic  # noqa: F401 - import side-effect registers extractors
-from di import store
+from di import observability, serving, store
 from di.config import get_settings
 from di.db import pgvector_available
 from di.extract import base as extract_base
@@ -28,9 +30,11 @@ from di.models import (
     KNode,
     NodeType,
     OcrResult,
+    SensitivityBucket,
 )
 from di.ocr import vision
 from di.retrieval_client import get_retrieval_client
+from di.storage import BlobStoreError, blob_key, get_blob_store
 from di.subtree import arep as arep_mod
 from di.subtree import build, context, merge, versioning
 
@@ -78,8 +82,13 @@ async def _embed_areps(reps: list[ARep], client: Any) -> None:
 
 
 async def _remerge_client_facts(client_id: str) -> int:
-    """Recompute the client-level merged view from all current fact nodes (confidence-weighted)."""
-    nodes = await store.fetch_subtree(client_id, current_only=True)
+    """Recompute the client-level merged view from all current fact nodes (confidence-weighted).
+
+    Pushes the fact filter into SQL (``fetch_client_facts``) so this stays proportional to the
+    client's fact count rather than to their whole corpus, and reapplies any human adjudications
+    so a reviewer's correction survives every subsequent ingest.
+    """
+    rows = await store.fetch_client_facts(client_id)
     inputs = [
         merge.FactInput(
             fact_id=str(n["id"]),
@@ -88,11 +97,23 @@ async def _remerge_client_facts(client_id: str) -> int:
             value_date=n.get("value_date"),
             value_num=n.get("value_num"),
             confidence=float(n.get("confidence") or 0.0),
+            verification_status=n.get("verification_status") or "unverified",
         )
-        for n in nodes
-        if n["node_type"] == NodeType.fact.value and n.get("attribute_key")
+        for n in rows
     ]
-    merged = merge.merge_facts(inputs, client_id=client_id)
+    adj_rows = await store.fetch_adjudications(client_id)
+    adjudications = {
+        r["attribute_key"]: merge.Adjudication(
+            attribute_key=r["attribute_key"], verdict=r["verdict"], value_text=r.get("value_text"),
+            value_date=r.get("value_date"), value_num=r.get("value_num"),
+            reviewer=r.get("reviewer"), note=r.get("note"),
+        )
+        for r in adj_rows
+    }
+    merged = merge.merge_facts(
+        inputs, client_id=client_id, adjudications=adjudications,
+        ontology_version=get_settings().ontology_version,
+    )
     await store.upsert_merged_facts(merged)
     return len(merged)
 
@@ -110,6 +131,23 @@ def _deterministic_facts(doc_type: str | None, ocr: OcrResult) -> list[Extracted
         return []
 
 
+async def _retain_blob(client_id: str, file_bytes: bytes, content_hash: str, filename: str,
+                       mime: str | None) -> tuple[str | None, str | None]:
+    """Persist the raw upload to the configured blob backend. Never fatal to ingest."""
+    store_ = get_blob_store()
+    if store_.backend == "none":
+        return None, "none"
+    try:
+        ref = await store_.put(
+            client_id=client_id, key=blob_key(client_id, content_hash, filename),
+            data=file_bytes, content_type=mime,
+        )
+        return ref.uri, ref.backend
+    except (BlobStoreError, Exception):  # noqa: BLE001 - retention must not break ingest
+        logger.exception("blob retention failed (backend=%s)", store_.backend)
+        return None, store_.backend
+
+
 async def ingest_document(
     client_id: str,
     file_bytes: bytes,
@@ -117,17 +155,21 @@ async def ingest_document(
     *,
     mime: str | None = None,
     created_by: str | None = None,
+    external_document_id: str | None = None,
 ) -> AsyncIterator[IngestEvent]:
-    """Async generator yielding pipeline stage events; persists the knowledge subtree."""
+    """Async generator yielding pipeline stage events; persists the knowledge subtree.
+
+    Emits a terminal ``error`` event on failure so a consumer can distinguish a real completion
+    from a dropped stream, then re-raises for the caller (the job runner) to record.
+    """
     settings = get_settings()
     client = get_retrieval_client(settings)
+    observability.observe_ingest("started")
     try:
-        yield IngestEvent(stage="ocr", status="start")
-        ocr = vision.extract_pages(file_bytes, filename=filename, mime=mime)
-        yield IngestEvent(stage="ocr", detail={"engine": ocr.engine, "pages": ocr.pages})
-
+        # Hash FIRST: an unchanged re-upload must no-op without paying for OCR (which can be a
+        # ~60s Azure Read round-trip per page).
         content_hash = versioning.content_hash(file_bytes)
-        existing = await store.find_document(client_id, filename)
+        existing = await store.find_document(client_id, filename, external_document_id)
         doc_id = str(existing["id"]) if existing else None
         current = await store.get_current_version(client_id, doc_id) if doc_id else None
         plan = versioning.decide_version(
@@ -136,31 +178,33 @@ async def ingest_document(
             current["content_hash"] if current else None,
         )
         if plan.is_noop:
+            observability.observe_ingest("noop")
             yield IngestEvent(stage="version", status="skip",
                               detail={"reason": "identical content already current", "doc_id": doc_id})
             yield IngestEvent(stage="done", detail={"doc_id": doc_id, "noop": True})
             return
 
+        yield IngestEvent(stage="ocr", status="start")
+        # OCR is fully synchronous (Azure Read polling, pdf2image, Tesseract, pypdf). Running it
+        # inline would block the event loop and stall every concurrent read on this instance.
+        with observability.stage_timer("ocr"):
+            ocr = await anyio.to_thread.run_sync(
+                lambda: vision.extract_pages(file_bytes, filename=filename, mime=mime)
+            )
+        observability.observe_ocr(ocr.engine)
+        yield IngestEvent(stage="ocr", detail={"engine": ocr.engine, "pages": ocr.pages})
+
+        blob_uri, blob_backend = await _retain_blob(
+            client_id, file_bytes, content_hash, filename, mime)
+
         yield IngestEvent(stage="gate", status="start")
-        gate = gate_pipeline.run_gate(ocr)
+        with observability.stage_timer("gate"):
+            gate = await anyio.to_thread.run_sync(gate_pipeline.run_gate, ocr)
+        observability.observe_gate(gate.decision.value, gate.sensitivity.value)
+        observability.observe_llm_egress(gate.decision == GateDecision.send_to_llm)
         yield IngestEvent(stage="gate", detail={
             "doc_type": gate.classification.doc_type, "sensitivity": gate.sensitivity.value,
             "decision": gate.decision.value, "lang": gate.lang_profile.dominant_lang})
-
-        meta = DocumentMeta(
-            id=doc_id, client_id=client_id, document_name=filename, sha256=content_hash, mime=mime,
-            doc_type=gate.classification.doc_type, doc_category=gate.classification.doc_category,
-            jurisdiction=gate.classification.jurisdiction, sensitivity_bucket=gate.sensitivity,
-            gate_decision=gate.decision, confidence=gate.classification.confidence,
-            ocr_engine=ocr.engine, page_count=ocr.pages,
-        )
-        doc_id = await store.insert_document(
-            meta, ocr_text=ocr.text, ocr_lines=[ln.model_dump(mode="json") for ln in ocr.lines],
-            lang_profile=gate.lang_profile.model_dump(mode="json"))
-        await store.record_decision_trace(client_id, doc_id, gate)
-        version_id = await store.create_version(
-            client_id, doc_id, content_hash=content_hash, version_no=plan.version_no,
-            supersedes_id=str(current["id"]) if current else None, created_by=created_by)
 
         # --- Extraction: deterministic always; LLM only when the gate allows it out ---
         yield IngestEvent(stage="extract", status="start")
@@ -175,11 +219,36 @@ async def ingest_document(
                 logger.exception("LLM extraction failed; continuing with deterministic facts")
         yield IngestEvent(stage="extract", detail={"facts": len(facts), "llm": allow_llm})
 
+        # The gate scores sensitivity from detected PII entities, which needs the optional [ml]
+        # stack. Raise its verdict to whatever we actually extracted, so a passport is never
+        # stored as LOW just because no PII model was installed.
+        doc_sens_value = serving.document_sensitivity(
+            gate.sensitivity.value, [f.attribute_key for f in facts])
+        doc_sensitivity = SensitivityBucket(doc_sens_value)
+
+        meta = DocumentMeta(
+            id=doc_id, client_id=client_id, document_name=filename,
+            external_document_id=external_document_id, sha256=content_hash, mime=mime,
+            blob_uri=blob_uri, blob_backend=blob_backend,
+            doc_type=gate.classification.doc_type, doc_category=gate.classification.doc_category,
+            jurisdiction=gate.classification.jurisdiction, sensitivity_bucket=doc_sensitivity,
+            gate_decision=gate.decision, confidence=gate.classification.confidence,
+            ocr_engine=ocr.engine, page_count=ocr.pages,
+        )
+        doc_id = await store.insert_document(
+            meta, ocr_text=ocr.text, ocr_lines=[ln.model_dump(mode="json") for ln in ocr.lines],
+            lang_profile=gate.lang_profile.model_dump(mode="json"))
+        await store.record_decision_trace(client_id, doc_id, gate)
+        version_id = await store.create_version(
+            client_id, doc_id, content_hash=content_hash, version_no=plan.version_no,
+            supersedes_id=str(current["id"]) if current else None, created_by=created_by)
+
         # --- Build subtree ---
         base = _base_path(client_id, gate.classification.doc_type, plan.version_no)
         nodes = build.build_subtree(
             client_id=client_id, doc_id=doc_id, version_id=version_id,
-            classification=gate.classification, ocr=ocr, facts=facts, base_path=base)
+            classification=gate.classification, ocr=ocr, facts=facts, base_path=base,
+            doc_sensitivity=doc_sensitivity)
 
         # --- Contextual enrichment + embeddings (LLM aids only for SEND_TO_LLM) ---
         if allow_llm:
@@ -213,10 +282,19 @@ async def ingest_document(
         merged = await _remerge_client_facts(client_id)
         yield IngestEvent(stage="merge", detail={"merged_facts": merged})
 
+        observability.observe_ingest("succeeded")
         yield IngestEvent(stage="done", detail={
             "doc_id": doc_id, "version_id": version_id, "version_no": plan.version_no,
             "doc_type": gate.classification.doc_type, "decision": gate.decision.value,
-            "nodes": len(nodes), "facts": len(facts)})
+            "nodes": len(nodes), "facts": len(facts), "blob_backend": blob_backend})
+    except Exception as exc:
+        # A failure used to kill the SSE stream silently after the 200 header; make it explicit
+        # and countable, then re-raise so the job runner records the terminal failure.
+        observability.observe_ingest("failed")
+        logger.exception("ingest failed for client=%s file=%s", client_id, filename)
+        yield IngestEvent(stage="error", status="error",
+                          detail={"error": str(exc), "type": type(exc).__name__})
+        raise
     finally:
         aclose = getattr(client, "aclose", None)
         if aclose is not None:
