@@ -18,9 +18,18 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from di import auth, ingest_runner, observability
+from di import auth, ingest_runner, observability, posture
 from di.config import get_settings
-from di.db import close_pool, init_pool, pgvector_available, run_migrations, set_embedding_dim
+from di.db import (
+    assert_rls_posture,
+    close_pool,
+    init_pool,
+    open_migration_connection,
+    pgvector_available,
+    run_migrations,
+    set_embedding_dim,
+    verify_migrations,
+)
 from di.observability import READINESS
 from di.retrieval_client import get_retrieval_client
 from di.storage import get_blob_store
@@ -78,9 +87,15 @@ async def _startup() -> None:
     try:
         await init_pool(settings)
         READINESS.set("db", True, "connected", host=settings.pg_host, database=settings.pg_database)
-    except Exception as exc:  # noqa: BLE001 - stay up so /readyz can report the cause
+    except Exception as exc:  # noqa: BLE001 - see is_production branch below
         READINESS.set("db", False, f"connection failed: {exc}")
         logger.exception("database unreachable at startup")
+        if settings.is_production:
+            # A transient outage in local/dev degrades gracefully (READINESS already says so).
+            # In production, staying alive here means the process serves traffic (or gets probed
+            # as live) having never run the posture guard below — the exact fail-open this
+            # closes. Propagate so uvicorn treats this as a failed boot.
+            raise
         return
 
     try:
@@ -101,12 +116,50 @@ async def _startup() -> None:
         )
         logger.warning("could not fetch /api/models; using default embedding dim")
 
+    migrations_ok = False
     try:
-        await run_migrations(settings)
-        READINESS.set("migrations", True, "applied")
-    except Exception as exc:  # noqa: BLE001 - boot degraded rather than crash, but SAY so
+        if settings.migrations_mode == "auto":
+            conn = await open_migration_connection(settings)
+            try:
+                await run_migrations(settings, connection=conn)
+            finally:
+                await conn.close()
+            READINESS.set("migrations", True, "applied (mode=auto)")
+        elif settings.migrations_mode == "verify":
+            await verify_migrations(settings)
+            READINESS.set("migrations", True, "verified against the ledger (mode=verify)")
+        else:  # "off"
+            READINESS.set("migrations", True, "skipped (mode=off)")
+        migrations_ok = True
+    except Exception as exc:  # noqa: BLE001 - see is_production branch below
         READINESS.set("migrations", False, f"failed: {exc}")
-        logger.exception("migrations failed; continuing in degraded mode")
+        logger.exception("migrations failed")
+        if settings.is_production:
+            # Schema drift or a failed apply is a *positively observed* violation, not a
+            # transient fault — refuse to serve rather than run against an unknown schema.
+            raise
+
+    if migrations_ok:
+        try:
+            violations = await assert_rls_posture(settings)
+            if violations:
+                detail = "; ".join(violations)
+                READINESS.set("rls", False, detail)
+                logger.critical("RLS posture violations: %s", detail)
+                if settings.is_production:
+                    raise RuntimeError(f"RLS posture violations: {detail}")
+            else:
+                READINESS.set("rls", True, "tenant_isolation verified on every tenant table; "
+                              "runtime role is least-privilege")
+        except RuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - see is_production branch below
+            READINESS.set("rls", False, f"posture check failed: {exc}")
+            logger.exception("could not evaluate RLS posture")
+            if settings.is_production:
+                raise
+    else:
+        READINESS.set("rls", False, "skipped: migrations did not complete")
 
     try:
         has_vec = await pgvector_available()
@@ -155,6 +208,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    # First statement, before FastAPI() exists: a misconfigured production instance must never
+    # construct an app object, let alone serve a request. See di/posture.py.
+    posture.assert_production_posture(settings)
+    READINESS.set("posture", True, "static config checks passed"
+                  if settings.is_production else "non-production: guards inactive")
     logging.basicConfig(level=settings.di_log_level)
     app = FastAPI(
         title=settings.app_name,

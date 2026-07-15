@@ -118,7 +118,8 @@ def main() -> int:
     check("/readyz reports ready", bool(ready.get("ready")),
           f"degraded={ready.get('degraded')}")
     comps = ready.get("components", {})
-    for name in ("db", "migrations", "pgvector", "retrieval", "blob", "ocr", "auth"):
+    for name in ("db", "migrations", "posture", "rls", "pgvector", "retrieval", "blob", "ocr",
+                 "auth"):
         c = comps.get(name, {})
         check(f"  component {name}", bool(c.get("ok")),
               f"{c.get('detail','')} {c.get('extra','')}".strip())

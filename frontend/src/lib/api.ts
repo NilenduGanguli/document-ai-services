@@ -307,23 +307,29 @@ export function listDocuments({
   );
 }
 
+/** Hard-delete one document. Requires admin scope on the API key. */
 export function deleteDocument(
   clientId: string,
   docId: string,
   signal?: AbortSignal,
 ): Promise<DeleteResponse> {
-  return json<DeleteResponse>(`${API_ROOT}/clients/${enc(clientId)}/documents/${enc(docId)}`, {
-    method: 'DELETE',
-    signal,
-  });
+  return json<DeleteResponse>(
+    `${API_ROOT}/admin/clients/${enc(clientId)}/documents/${enc(docId)}`,
+    { method: 'DELETE', signal },
+  );
 }
 
-/** Purge every trace of a client. Requires admin scope on the API key. */
+/**
+ * Purge every trace of a client (right-to-erasure / tenant off-boarding). Irreversible.
+ * Requires admin scope; the backend requires `confirm_client_id` to match the path to guard
+ * against a mistaken call.
+ */
 export function purgeClient(clientId: string, signal?: AbortSignal): Promise<DeleteResponse> {
-  return json<DeleteResponse>(`${API_ROOT}/clients/${enc(clientId)}`, {
-    method: 'DELETE',
+  return postJson<DeleteResponse>(
+    `${API_ROOT}/admin/clients/${enc(clientId)}/purge`,
+    { confirm_client_id: clientId },
     signal,
-  });
+  );
 }
 
 // --- Tree ------------------------------------------------------------------

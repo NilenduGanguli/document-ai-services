@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from di import serving, store
-from di.auth import Principal, authorize_client, require_principal
+from di.auth import Principal, authorize_client, require_scope
 from di.config import get_settings
 from di.store import clamp_limit
 
@@ -84,7 +84,7 @@ async def get_tree(
     client_id: str, doc_id: str | None = None, path: str | None = None,
     max_depth: int | None = Query(None, ge=1, le=32),  # noqa: B008
     current_only: bool = True, mask: bool | None = None,
-    principal: Principal = Depends(require_principal),  # noqa: B008
+    principal: Principal = Depends(require_scope("read")),  # noqa: B008
 ) -> TreeResponse:
     """Nested knowledge subtree for a client (optionally scoped to a document or path)."""
     authorize_client(principal, client_id)
@@ -99,7 +99,7 @@ async def get_tree(
 async def get_facts(
     client_id: str, attribute_key: str | None = None, verified_only: bool = False,
     mask: bool | None = None,
-    principal: Principal = Depends(require_principal),  # noqa: B008
+    principal: Principal = Depends(require_scope("read")),  # noqa: B008
 ) -> FactsResponse:
     """Merged client-level facts. ``verified_only`` means independently verified, not self-scored."""
     authorize_client(principal, client_id)
@@ -114,7 +114,7 @@ async def get_documents(
     client_id: str,
     limit: int | None = Query(None, ge=1, le=200),  # noqa: B008
     cursor: str | None = None,
-    principal: Principal = Depends(require_principal),  # noqa: B008
+    principal: Principal = Depends(require_scope("read")),  # noqa: B008
 ) -> DocumentsResponse:
     """List a client's documents (keyset-paginated; excludes raw OCR text by design)."""
     authorize_client(principal, client_id)
@@ -135,7 +135,7 @@ async def get_changes(
     client_id: str, since: str | None = None,
     after_seq: int | None = Query(None, description="Monotonic cursor; preferred over `since`"),  # noqa: B008
     limit: int | None = Query(None, ge=1, le=200),  # noqa: B008
-    principal: Principal = Depends(require_principal),  # noqa: B008
+    principal: Principal = Depends(require_scope("read")),  # noqa: B008
 ) -> ChangesResponse:
     """Version change feed. Resume with ``after_seq`` for exactly-once-ish delivery."""
     authorize_client(principal, client_id)
@@ -148,7 +148,7 @@ async def get_changes(
 @router.get("/{client_id}/docs/{doc_id}/manifest")
 async def get_manifest(
     client_id: str, doc_id: str,
-    principal: Principal = Depends(require_principal),  # noqa: B008
+    principal: Principal = Depends(require_scope("read")),  # noqa: B008
 ) -> dict[str, Any]:
     """Per-document capabilities manifest: what this document can answer and how."""
     authorize_client(principal, client_id)
@@ -163,7 +163,7 @@ async def get_manifest(
 @router.get("/{client_id}/docs/{doc_id}/answerable", response_model=AnswerableResponse)
 async def get_answerable(
     client_id: str, doc_id: str,
-    principal: Principal = Depends(require_principal),  # noqa: B008
+    principal: Principal = Depends(require_scope("read")),  # noqa: B008
 ) -> AnswerableResponse:
     """The questions this document can answer, derived from its accessibility representations."""
     authorize_client(principal, client_id)

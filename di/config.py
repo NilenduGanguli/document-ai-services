@@ -35,6 +35,20 @@ class Settings(BaseSettings):
     pg_hash_partitions: int = 64
     rls_enabled: bool = True
 
+    # --- Migrations / roles ---
+    # Owner-class role used ONLY for schema DDL (migrations). Empty falls back to pg_user, which
+    # keeps bare local/unit-test runs working with a single role. In production this should be a
+    # distinct role so the runtime pool never holds DDL-capable credentials — see MIGRATIONS_MODE.
+    pg_migration_user: str = ""
+    pg_migration_password: str = ""
+    # auto = apply migrations in-process as the migration role (compose/demo default); verify =
+    # never apply, only assert the ledger matches what's on disk and refuse to boot on drift (the
+    # migration step runs separately via `python -m di.migrate`); off = skip entirely (advanced).
+    migrations_mode: str = "auto"
+    # Path to a CA bundle for verify-full TLS to Postgres. Empty = asyncpg's default (sslmode
+    # "prefer" if the server offers it, unverified). Recommended for any non-local environment.
+    pg_ssl_root_cert: str = ""
+
     # --- Retrieval service (model gateway) ---
     retrieval_base_url: str = "http://localhost:8000"
     retrieval_api_key: str = ""
@@ -97,6 +111,14 @@ class Settings(BaseSettings):
         allowed = {"postgres", "local", "s3", "none"}
         if v not in allowed:
             raise ValueError(f"blob_backend must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
+    @field_validator("migrations_mode")
+    @classmethod
+    def _valid_migrations_mode(cls, v: str) -> str:
+        allowed = {"auto", "verify", "off"}
+        if v not in allowed:
+            raise ValueError(f"migrations_mode must be one of {sorted(allowed)}, got {v!r}")
         return v
 
     @field_validator("azure_vision_endpoint", "retrieval_base_url")

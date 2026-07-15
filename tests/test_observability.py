@@ -15,7 +15,7 @@ from di import observability as obs
 # Readiness
 # ---------------------------------------------------------------------------
 def test_required_components_and_singleton():
-    assert obs.REQUIRED_COMPONENTS == ("db", "migrations")
+    assert obs.REQUIRED_COMPONENTS == ("db", "migrations", "posture", "rls")
     assert isinstance(obs.READINESS, obs.Readiness)
     for name in obs.REQUIRED_COMPONENTS:
         assert name in obs.KNOWN_COMPONENTS
@@ -26,20 +26,22 @@ def test_fresh_registry_is_not_ready():
     r = obs.Readiness()
     assert r.ready() is False
     assert r.snapshot() == {}
-    assert r.degraded() == ["db", "migrations"]
+    assert r.degraded() == sorted(obs.REQUIRED_COMPONENTS)
 
 
 def test_partially_reported_required_component_is_not_ready():
     r = obs.Readiness()
     r.set("db", True)
     assert r.ready() is False
-    assert r.degraded() == ["migrations"]
+    assert r.degraded() == sorted({"migrations", "posture", "rls"})
 
 
 def test_all_required_ok_is_ready():
     r = obs.Readiness()
     r.set("db", True)
     r.set("migrations", True)
+    r.set("posture", True)
+    r.set("rls", True)
     assert r.ready() is True
     assert r.degraded() == []
 
@@ -48,8 +50,10 @@ def test_failed_required_component_is_not_ready():
     r = obs.Readiness()
     r.set("db", True)
     r.set("migrations", False, "relation knode does not exist")
+    r.set("posture", True)
+    r.set("rls", False, "skipped: migrations did not complete")
     assert r.ready() is False
-    assert r.degraded() == ["migrations"]
+    assert r.degraded() == sorted({"migrations", "rls"})
 
 
 def test_informational_component_does_not_gate_readiness():
@@ -57,6 +61,8 @@ def test_informational_component_does_not_gate_readiness():
     r = obs.Readiness()
     r.set("db", True)
     r.set("migrations", True)
+    r.set("posture", True)
+    r.set("rls", True)
     r.set("pgvector", False, "extension not installed")
     r.set("retrieval", False, "stub embeddings")
     assert r.ready() is True

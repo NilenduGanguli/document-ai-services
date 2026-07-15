@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from di import store
-from di.auth import Principal, authorize_client, require_principal
+from di.auth import Principal, authorize_client, require_scope
 
 router = APIRouter(prefix="/api/v1/nodes", tags=["nodes"])
 
@@ -31,7 +31,7 @@ class ProvenanceResponse(BaseModel):
 @router.get("/{node_id}/provenance", response_model=ProvenanceResponse)
 async def get_provenance(
     node_id: str, client_id: str,
-    principal: Principal = Depends(require_principal),  # noqa: B008
+    principal: Principal = Depends(require_scope("read")),  # noqa: B008
 ) -> ProvenanceResponse:
     """Trace one node back to its exact source: document, page, bbox, extractor, model."""
     authorize_client(principal, client_id)

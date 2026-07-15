@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from di import observability, serving, store
-from di.auth import Principal, authorize_client, require_principal
+from di.auth import Principal, authorize_client, require_scope
 from di.config import get_settings
 from di.db import pgvector_available
 from di.retrieval_client import get_retrieval_client
@@ -42,7 +42,7 @@ class SearchResponse(BaseModel):
 @router.post("/clients/{client_id}/search", response_model=SearchResponse)
 async def search(
     client_id: str, req: SearchRequest,
-    principal: Principal = Depends(require_principal),  # noqa: B008
+    principal: Principal = Depends(require_scope("read")),  # noqa: B008
 ) -> SearchResponse:
     """Hybrid search across a client's knowledge, grounded in source documents."""
     authorize_client(principal, client_id)

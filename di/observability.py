@@ -42,17 +42,22 @@ except ImportError:  # pragma: no cover - depends on the installed dependency se
 # Readiness
 # ---------------------------------------------------------------------------
 #: Components that must be healthy for the service to be considered ready.
-REQUIRED_COMPONENTS: tuple[str, ...] = ("db", "migrations")
+#: Grown per phase of the enterprise-scale-out plan: db/migrations (baseline) + posture/rls
+#: (RLS production posture) — see docs/specs/2026-07-15-enterprise-scale-plan.md interaction #16.
+REQUIRED_COMPONENTS: tuple[str, ...] = ("db", "migrations", "posture", "rls")
 
 #: The component vocabulary. Anything outside this set is still accepted by
 #: :meth:`Readiness.set`; this tuple documents what the boot path is expected to report.
 KNOWN_COMPONENTS: tuple[str, ...] = (
     "db",
     "migrations",
+    "posture",
+    "rls",
     "pgvector",
     "retrieval",
     "ocr",
     "blob",
+    "auth",
 )
 
 

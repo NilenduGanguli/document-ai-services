@@ -4,8 +4,16 @@
 #   BLOB_BACKEND=local docker compose up      # raw bytes on a docker volume
 #   docker compose --profile s3 up --build    # raw bytes in MinIO (S3-compatible)
 #
-# The app applies migrations on startup (under an advisory lock) and, because this DB ships
-# pgvector, creates the vector extension, embedding columns and HNSW indexes.
+# The app applies migrations on startup (under a dedicated di_owner connection, advisory-locked)
+# and, because this DB ships pgvector, creates the vector extension, embedding columns and HNSW
+# indexes. Runtime traffic is served as the least-privilege di_app role under FORCE RLS — see
+# docker/initdb/01_roles.sql (created automatically on first init of an empty data directory) and
+# docs/specs/2026-07-15-enterprise-scale-plan.md §3 "RLS production posture".
+#
+# NOTE: if you have an existing `pgdata` volume from before this role split, the initdb script
+# will NOT run against it (postgres only runs docker-entrypoint-initdb.d on an EMPTY data
+# directory). Run `docker compose down -v` once to re-provision, or run
+# `tools/bootstrap_roles.sql` against the existing database as the `di` superuser.
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -19,6 +27,7 @@ services:
       - "${DI_DB_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U di -d document_intelligence"]
       interval: 3s
@@ -31,12 +40,20 @@ services:
       DI_ENV: local
       PG_HOST: db
       PG_PORT: "5432"
-      PG_USER: di
-      PG_PASSWORD: di
+      # Runtime pool connects as the least-privilege role — see docker/initdb/01_roles.sql.
+      PG_USER: di_app
+      PG_PASSWORD: di_app
+      # Migrations (DDL) run on a dedicated connection as the schema owner, never on the runtime
+      # pool. MIGRATIONS_MODE=auto means this app process runs them itself at boot (fine for a
+      # single-node demo); production sets MIGRATIONS_MODE=verify and runs `python -m di.migrate`
+      # as a separate step so app instances never hold DDL-capable credentials at all.
+      PG_MIGRATION_USER: di_owner
+      PG_MIGRATION_PASSWORD: di_owner
+      MIGRATIONS_MODE: auto
       PG_DATABASE: document_intelligence
       PG_SCHEMA: di
       PG_HASH_PARTITIONS: "8"
-      RLS_ENABLED: "false"          # demo connects as the DB owner; prod uses a non-superuser + RLS
+      RLS_ENABLED: "true"
 
       # --- Auth: on by default. This bootstrap key is seeded at startup and is what the console
       # --- and the smoke test use. Rotate/replace it for anything beyond a local demo.

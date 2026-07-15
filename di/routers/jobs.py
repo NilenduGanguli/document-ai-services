@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from di import jobs as jobs_mod
-from di.auth import Principal, authorize_client, require_principal
+from di.auth import Principal, authorize_client, require_scope
 from di.jobs import Job, JobStatus
 from di.store import clamp_limit
 
@@ -29,7 +29,7 @@ async def list_jobs(
     limit: int | None = Query(None, ge=1, le=200),  # noqa: B008
     cursor: str | None = None,
     status: JobStatus | None = None,
-    principal: Principal = Depends(require_principal),  # noqa: B008
+    principal: Principal = Depends(require_scope("read")),  # noqa: B008
 ) -> JobListResponse:
     """List a client's ingest jobs, newest first (keyset pagination)."""
     authorize_client(principal, client_id)
@@ -46,7 +46,7 @@ async def list_jobs(
 async def get_job(
     job_id: str,
     client_id: str,
-    principal: Principal = Depends(require_principal),  # noqa: B008
+    principal: Principal = Depends(require_scope("read")),  # noqa: B008
 ) -> Job:
     """Fetch one job: status, current stage, every recorded stage event, and any error."""
     authorize_client(principal, client_id)
