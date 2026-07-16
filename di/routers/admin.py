@@ -12,7 +12,7 @@ from datetime import date, datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from di import auth, jobs, store
+from di import auth, jobs, ontology, store
 from di.auth import Principal, authorize_client, require_scope
 from di.config import get_settings
 from di.pipeline import _remerge_client_facts
@@ -36,12 +36,24 @@ class PurgeRequest(BaseModel):
 
 class AdjudicationRequest(BaseModel):
     attribute_key: str
+    #: Required for multi-valued attributes (see di.ontology.MULTI_VALUED_ATTRIBUTE_KEYS); must be
+    #: '' for single-valued ones. Identifies WHICH instance (director, account...) this verdict
+    #: applies to.
+    instance_key: str = ""
     verdict: str = Field(..., pattern="^(accept|reject|override)$")
     value_text: str | None = None
     value_date: date | None = None
     value_num: float | None = None
     reviewer: str | None = None
     note: str | None = None
+
+
+class ClearAdjudicationResponse(BaseModel):
+    client_id: str
+    attribute_key: str
+    instance_key: str
+    cleared: bool
+    remerged_facts: int | None = None
 
 
 class ApiKeyRequest(BaseModel):
@@ -143,25 +155,111 @@ async def purge_client(
     return DeleteResult(client_id=client_id, deleted=counts)
 
 
+async def _instance_exists(client_id: str, attribute_key: str, instance_key: str) -> bool:
+    """True if ``instance_key`` references either a live merged row OR an existing adjudication
+    row for this (client_id, attribute_key).
+
+    The adjudication check is what makes reject reversible: a reject on a multi-valued instance
+    deletes its client_merged_fact row (di.subtree.merge omits it from the output entirely), so
+    checking only the merged rows would make every subsequent verdict on that instance 404
+    forever — the reviewer who rejected the wrong director could never accept/override/re-review
+    it. See also DELETE .../adjudications/{attribute_key} for undoing a verdict outright.
+    """
+    merged = await store.fetch_merged_facts(client_id, attribute_key=attribute_key)
+    if any(r.get("instance_key") == instance_key for r in merged):
+        return True
+    adjudications = await store.fetch_adjudications(client_id)
+    return any(r.get("attribute_key") == attribute_key and r.get("instance_key") == instance_key
+              for r in adjudications)
+
+
 @router.post("/clients/{client_id}/adjudicate", response_model=dict)
 async def adjudicate(
     client_id: str, body: AdjudicationRequest,
     principal: Principal = Depends(require_scope("admin")),  # noqa: B008
 ) -> dict:
-    """Record a reviewer's decision on a fact and re-merge so it takes effect immediately.
+    """Record a reviewer's decision on a fact (or one instance of a multi-valued attribute) and
+    re-merge so it takes effect immediately.
 
     The decision is stored separately from the derived facts, so the next ingest reapplies it
-    instead of silently clobbering the correction.
+    instead of silently clobbering the correction. Fail-closed on cardinality: a multi-valued
+    attribute requires a non-empty ``instance_key`` that resolves to a real instance (422/404
+    otherwise — prevents a typo'd fingerprint from silently doing nothing); a single-valued one
+    rejects a non-empty ``instance_key`` outright.
     """
     authorize_client(principal, client_id)
+    cardinality = ontology.cardinality_for(body.attribute_key)
+    if cardinality == "multi":
+        if not body.instance_key:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{body.attribute_key} is multi-valued — instance_key is required")
+        if not await _instance_exists(client_id, body.attribute_key, body.instance_key):
+            raise HTTPException(
+                status_code=404,
+                detail=f"no merged or previously-adjudicated instance "
+                       f"{body.attribute_key}:{body.instance_key} for {client_id}")
+    elif body.instance_key:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{body.attribute_key} is single-valued — instance_key must be empty")
     await store.upsert_adjudication(
-        client_id, attribute_key=body.attribute_key, verdict=body.verdict,
-        value_text=body.value_text, value_date=body.value_date, value_num=body.value_num,
-        reviewer=body.reviewer or principal.name, note=body.note,
+        client_id, attribute_key=body.attribute_key, instance_key=body.instance_key,
+        verdict=body.verdict, value_text=body.value_text, value_date=body.value_date,
+        value_num=body.value_num, reviewer=body.reviewer or principal.name, note=body.note,
     )
     remerged = await _remerge_client_facts(client_id)
     return {"client_id": client_id, "attribute_key": body.attribute_key,
-            "verdict": body.verdict, "remerged_facts": remerged}
+            "instance_key": body.instance_key, "verdict": body.verdict,
+            "remerged_facts": remerged}
+
+
+@router.get("/clients/{client_id}/adjudications", response_model=list[dict])
+async def list_adjudications(
+    client_id: str,
+    principal: Principal = Depends(require_scope("admin")),  # noqa: B008
+) -> list[dict]:
+    """Live verdicts, one per (attribute_key, instance_key) — including multi-valued-instance
+    rejects, whose merged row is otherwise invisible (removed from client_merged_fact on reject)."""
+    authorize_client(principal, client_id)
+    return await store.fetch_adjudications(client_id)
+
+
+@router.get("/clients/{client_id}/adjudications/history", response_model=list[dict])
+async def adjudication_history(
+    client_id: str, attribute_key: str | None = None, instance_key: str | None = None,
+    principal: Principal = Depends(require_scope("admin")),  # noqa: B008
+) -> list[dict]:
+    """The durable, append-only compliance record — every verdict ever recorded, including ones
+    later overwritten or cleared. ``GET .../adjudications`` above only shows the current live
+    verdict; a bank's audit needs "what did we decide, and when, and did it change" too.
+    """
+    authorize_client(principal, client_id)
+    return await store.fetch_adjudication_events(
+        client_id, attribute_key=attribute_key, instance_key=instance_key)
+
+
+@router.delete("/clients/{client_id}/adjudications/{attribute_key}",
+               response_model=ClearAdjudicationResponse)
+async def clear_adjudication(
+    client_id: str, attribute_key: str, instance_key: str = "", reviewer: str | None = None,
+    principal: Principal = Depends(require_scope("admin")),  # noqa: B008
+) -> ClearAdjudicationResponse:
+    """Remove a live verdict so the next re-merge falls back to automatic resolution.
+
+    ``instance_key`` is a query parameter (default ``''``) rather than a second path segment: an
+    empty path segment does not route cleanly, and single-valued attributes need to reach this
+    endpoint too (even though their reject is not a one-way door — this exists primarily to undo a
+    wrong reject/override on a multi-valued instance).
+    """
+    authorize_client(principal, client_id)
+    cleared = await store.clear_adjudication(
+        client_id, attribute_key=attribute_key, instance_key=instance_key,
+        reviewer=reviewer or principal.name)
+    remerged = await _remerge_client_facts(client_id) if cleared else None
+    return ClearAdjudicationResponse(client_id=client_id, attribute_key=attribute_key,
+                                     instance_key=instance_key, cleared=cleared,
+                                     remerged_facts=remerged)
 
 
 @router.get("/keys", response_model=list[dict])

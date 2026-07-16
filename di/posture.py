@@ -83,6 +83,14 @@ def evaluate_static_posture(settings: Settings) -> list[str]:
             "records instead of refusing the read; production must accept 'no audit -> no reads' "
             "explicitly (set ACCESS_AUDIT_STRICT=true)"
         )
+    if not settings.instance_fingerprint_hmac_key:
+        violations.append(
+            "INSTANCE_FINGERPRINT_HMAC_KEY is unset — multi-valued-fact instance fingerprints "
+            "(director/beneficial-owner identities) would use an unsalted SHA-256, letting anyone "
+            "with API access dictionary-confirm a masked value's identity; set a deployment-scoped "
+            "key from Secret Manager (rotation is unsupported — rotating it orphans every existing "
+            "adjudication keyed on the old fingerprints)"
+        )
     return violations
 
 

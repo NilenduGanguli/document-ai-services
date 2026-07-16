@@ -98,7 +98,7 @@ def test_multiple_violations_all_reported() -> None:
     assert len(violations) == 3
 
 
-def test_tenant_tables_constant_has_exactly_ten_tables() -> None:
-    """004_rls.sql's 7 + 005_hardening.sql's 3 == the 10 tables every posture check covers."""
-    assert len(_TENANT_TABLES) == 10
-    assert len(set(_TENANT_TABLES)) == 10
+def test_tenant_tables_constant_has_exactly_eleven_tables() -> None:
+    """004_rls.sql's 7 + 005_hardening.sql's 3 + 008's di_fact_adjudication_event == 11."""
+    assert len(_TENANT_TABLES) == 11
+    assert len(set(_TENANT_TABLES)) == 11

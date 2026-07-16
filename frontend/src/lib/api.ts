@@ -8,8 +8,12 @@
  * to that client) instead of failing silently.
  */
 import type {
+  AdjudicateResponse,
+  AdjudicationRow,
+  AdjudicationVerdict,
   AnswerableResponse,
   ChangesResponse,
+  ClearAdjudicationResponse,
   DeleteResponse,
   DocumentsResponse,
   FactsResponse,
@@ -461,5 +465,85 @@ export function getAnswerable(
   return json<AnswerableResponse>(
     `${API_ROOT}/clients/${enc(clientId)}/docs/${enc(docId)}/answerable`,
     { signal },
+  );
+}
+
+// --- Adjudication ------------------------------------------------------------
+
+export interface AdjudicateArgs {
+  clientId: string;
+  attributeKey: string;
+  /** '' for single-valued attributes; required for multi-valued ones. */
+  instanceKey?: string;
+  verdict: AdjudicationVerdict;
+  valueText?: string | null;
+  valueDate?: string | null;
+  valueNum?: number | null;
+  reviewer?: string | null;
+  note?: string | null;
+}
+
+/** Record a reviewer's decision and re-merge so it takes effect immediately. Requires admin scope. */
+export function adjudicate(
+  { clientId, attributeKey, instanceKey, verdict, valueText, valueDate, valueNum, reviewer, note }:
+    AdjudicateArgs,
+  signal?: AbortSignal,
+): Promise<AdjudicateResponse> {
+  return postJson<AdjudicateResponse>(
+    `${API_ROOT}/admin/clients/${enc(clientId)}/adjudicate`,
+    {
+      attribute_key: attributeKey,
+      instance_key: instanceKey ?? '',
+      verdict,
+      value_text: valueText,
+      value_date: valueDate,
+      value_num: valueNum,
+      reviewer,
+      note,
+    },
+    signal,
+  );
+}
+
+/** Live verdicts for a client — including multi-valued-instance rejects, whose merged row is
+ * otherwise invisible. Requires admin scope. */
+export function listAdjudications(
+  clientId: string,
+  signal?: AbortSignal,
+): Promise<AdjudicationRow[]> {
+  return json<AdjudicationRow[]>(`${API_ROOT}/admin/clients/${enc(clientId)}/adjudications`, {
+    signal,
+  });
+}
+
+/** The durable, append-only compliance record — every verdict ever recorded, including ones later
+ * overwritten or cleared. Requires admin scope. */
+export function getAdjudicationHistory(
+  clientId: string,
+  attributeKey?: string,
+  instanceKey?: string,
+  signal?: AbortSignal,
+): Promise<AdjudicationRow[]> {
+  return json<AdjudicationRow[]>(
+    `${API_ROOT}/admin/clients/${enc(clientId)}/adjudications/history${qs({
+      attribute_key: attributeKey,
+      instance_key: instanceKey,
+    })}`,
+    { signal },
+  );
+}
+
+/** Remove a live verdict so the next re-merge falls back to automatic resolution — the way to
+ * undo a wrong reject/override on a multi-valued instance. Requires admin scope. */
+export function clearAdjudication(
+  clientId: string,
+  attributeKey: string,
+  instanceKey = '',
+  signal?: AbortSignal,
+): Promise<ClearAdjudicationResponse> {
+  return json<ClearAdjudicationResponse>(
+    `${API_ROOT}/admin/clients/${enc(clientId)}/adjudications/${enc(attributeKey)}` +
+      qs({ instance_key: instanceKey }),
+    { method: 'DELETE', signal },
   );
 }

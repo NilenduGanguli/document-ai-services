@@ -9,7 +9,8 @@ from __future__ import annotations
 from datetime import date
 
 from di.models import ClientFact
-from di.subtree.merge import FactInput, merge_facts
+from di.ontology import MULTI_VALUED_ATTRIBUTE_KEYS
+from di.subtree.merge import Adjudication, FactInput, merge_facts
 
 
 def test_agreement_no_conflict():
@@ -138,3 +139,54 @@ def test_none_value_does_not_create_phantom_conflict():
     assert fact.conflict is False
     assert fact.resolved_value == "Garcia"
     assert set(fact.source_fact_ids) == {"empty", "real"}
+
+
+# ---------------------------------------------------------------------------
+# Golden regression: single-valued attributes must be byte-identical whether multi_keys is empty
+# or the real production set — the sentinel design's entire point is zero blast radius for keys
+# that were never promoted. Every scenario above uses single-valued keys, so re-running them all
+# with the real multi_keys set (instead of the implicit empty default) proves this directly.
+# ---------------------------------------------------------------------------
+def test_golden_regression_with_real_multi_keys_set():
+    facts = [
+        FactInput(fact_id="a", attribute_key="identity.full_name", value="John Smith", confidence=0.7),
+        FactInput(fact_id="b", attribute_key="identity.full_name", value="John Smith", confidence=0.9),
+        FactInput(fact_id="low", attribute_key="identity.date_of_birth", value="1990-01-01",
+                  confidence=0.4),
+        FactInput(fact_id="high", attribute_key="identity.date_of_birth", value="1991-02-02",
+                  confidence=0.95),
+    ]
+    baseline = merge_facts(facts)
+    with_multi = merge_facts(facts, multi_keys=MULTI_VALUED_ATTRIBUTE_KEYS)
+    assert [f.model_dump() for f in baseline] == [f.model_dump() for f in with_multi]
+    assert all(f.instance_key == "" for f in with_multi)
+
+
+def test_tuple_keyed_adjudication_on_single_key():
+    """adjudications is keyed by (attribute_key, instance_key); '' is the sentinel for single
+    keys, matching what di.pipeline._remerge_client_facts now builds from stored rows."""
+    facts = [FactInput(fact_id="a", attribute_key="id.curp", value="ABCD010101HDFXYZ09",
+                       confidence=0.5)]
+    adjudications = {
+        ("id.curp", ""): Adjudication(attribute_key="id.curp", instance_key="", verdict="override",
+                                      value_text="CORRECTED09", reviewer="reviewer-1"),
+    }
+    result = merge_facts(facts, adjudications=adjudications)
+    assert result[0].resolved_value == "CORRECTED09"
+    assert result[0].adjudicated is True
+    assert result[0].instance_key == ""
+
+
+def test_reject_on_single_key_keeps_row_nulled_and_flagged():
+    """Single-valued reject is legacy behavior verbatim: row stays, values nulled, needs_review."""
+    facts = [FactInput(fact_id="a", attribute_key="income.employer", value="Acme", confidence=0.5)]
+    adjudications = {
+        ("income.employer", ""): Adjudication(attribute_key="income.employer", verdict="reject",
+                                              reviewer="reviewer-1"),
+    }
+    result = merge_facts(facts, adjudications=adjudications)
+    assert len(result) == 1
+    fact = result[0]
+    assert fact.resolved_value is None
+    assert fact.needs_review is True
+    assert fact.confidence == 0.0

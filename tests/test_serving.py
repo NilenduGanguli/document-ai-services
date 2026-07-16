@@ -101,6 +101,60 @@ def test_sensitivity_for_key():
     assert serving.sensitivity_for_key(None) == "LOW"
 
 
+def test_ownership_keys_are_high_sensitivity():
+    """Beneficial-owner and director identities are personal data — must be masked by default,
+    same as any other HIGH-sensitivity attribute."""
+    assert serving.sensitivity_for_key("ownership.director") == "HIGH"
+    assert serving.sensitivity_for_key("ownership.beneficial_owner") == "HIGH"
+
+
+def test_project_facts_instance_count_multiple_directors():
+    rows = [
+        {"attribute_key": "ownership.director", "instance_key": "aaaa", "resolved_value": "Juan",
+         "confidence": 0.9, "conflict": False, "verification_status": "checksum_verified"},
+        {"attribute_key": "ownership.director", "instance_key": "bbbb", "resolved_value": "Maria",
+         "confidence": 0.9, "conflict": False, "verification_status": "checksum_verified"},
+        {"attribute_key": "ownership.director", "instance_key": "cccc", "resolved_value": "Carlos",
+         "confidence": 0.9, "conflict": False, "verification_status": "checksum_verified"},
+        {"attribute_key": "id.ssn", "instance_key": "", "resolved_value": "536-90-4399",
+         "confidence": 0.9, "conflict": False, "verification_status": "checksum_verified"},
+    ]
+    out = serving.project_facts(rows)
+    directors = [f for f in out if f["attribute_key"] == "ownership.director"]
+    ssn = next(f for f in out if f["attribute_key"] == "id.ssn")
+    assert all(f["instance_count"] == 3 for f in directors)
+    assert ssn["instance_count"] == 1
+
+
+def test_project_facts_instance_count_computed_before_verified_only_filter():
+    """instance_count must reflect ALL instances, not just the ones that survive verified_only —
+    otherwise a client with 2/3 verified directors would misreport 'instance_count: 2'."""
+    rows = [
+        {"attribute_key": "ownership.director", "instance_key": "aaaa", "resolved_value": "Juan",
+         "confidence": 0.9, "conflict": False, "verification_status": "checksum_verified"},
+        {"attribute_key": "ownership.director", "instance_key": "bbbb", "resolved_value": "Maria",
+         "confidence": 0.4, "conflict": False, "verification_status": "llm_unverified"},
+    ]
+    out = serving.project_facts(rows, verified_only=True)
+    assert len(out) == 1
+    assert out[0]["instance_count"] == 2
+
+
+def test_project_facts_redacts_identity_basis_under_mask():
+    """resolution_rationale.identity_basis carries the cleartext normalized value (a director's
+    name) an instance was fingerprinted from — it must be redacted whenever mask hides the rest of
+    the row, or a masked response still leaks the identity in cleartext via the rationale."""
+    rows = [{
+        "attribute_key": "ownership.director", "instance_key": "aaaa", "resolved_value": "Juan Perez",
+        "confidence": 0.9, "conflict": False, "verification_status": "checksum_verified",
+        "resolution_rationale": {"identity_basis": "juan perez", "identity_algo": "nfkd-casefold-ws-v1"},
+    }]
+    masked = serving.project_facts(rows, mask=True)
+    assert masked[0]["resolution_rationale"]["identity_basis"] == "***"
+    clear = serving.project_facts(rows, mask=False)
+    assert clear[0]["resolution_rationale"]["identity_basis"] == "juan perez"
+
+
 def test_masking_redacts_date_and_num_not_just_text():
     """A masked DOB must not leak via value_date (regression: UI showed `date: 1985-03-12`)."""
     rows = [{

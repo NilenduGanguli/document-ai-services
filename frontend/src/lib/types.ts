@@ -115,6 +115,12 @@ export interface SearchResponse {
 
 export interface MergedFact {
   attribute_key: string;
+  /** '' for single-valued attributes; a deterministic fingerprint identifying one instance
+   * (director, beneficial owner, account...) for multi-valued ones. */
+  instance_key?: string;
+  /** How many rows share this attribute_key in the response — always 1 for single-valued
+   * attributes; >1 signals a multi-valued attribute with several concurrent instances. */
+  instance_count?: number;
   resolved_value?: string | null;
   value_date?: string | null;
   value_num?: number | null;
@@ -122,16 +128,53 @@ export interface MergedFact {
   conflict?: boolean | null;
   needs_review?: boolean | null;
   verified?: boolean;
+  adjudicated?: boolean;
   masked?: boolean;
   sensitivity?: SensitivityBucket | string | null;
   source_fact_ids?: string[] | null;
   verification_status?: VerificationStatus | string | null;
+  resolution_rationale?: Record<string, unknown> | null;
 }
 
 export interface FactsResponse {
   client_id: string;
   count: number;
   facts: MergedFact[];
+}
+
+// --- Adjudication ------------------------------------------------------------
+
+export type AdjudicationVerdict = 'accept' | 'reject' | 'override';
+
+export interface AdjudicationRow {
+  id: string;
+  client_id: string;
+  attribute_key: string;
+  instance_key: string;
+  verdict: AdjudicationVerdict;
+  value_text?: string | null;
+  value_date?: string | null;
+  value_num?: number | null;
+  reviewer?: string | null;
+  note?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AdjudicateResponse {
+  client_id: string;
+  attribute_key: string;
+  instance_key: string;
+  verdict: AdjudicationVerdict;
+  remerged_facts: number;
+}
+
+export interface ClearAdjudicationResponse {
+  client_id: string;
+  attribute_key: string;
+  instance_key: string;
+  cleared: boolean;
+  remerged_facts?: number | null;
 }
 
 // --- Documents -------------------------------------------------------------

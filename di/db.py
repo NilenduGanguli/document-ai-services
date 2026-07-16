@@ -38,7 +38,7 @@ _PARTITIONED_TABLES = ("knode", "arep")
 #: every tenant-scoped table that must carry a FORCE-RLS tenant_isolation policy (004 + 005).
 _TENANT_TABLES = (
     "di_documents", "doc_version", "di_entity", "client_merged_fact", "di_decision_trace",
-    "knode", "arep", "di_job", "di_blob", "di_fact_adjudication",
+    "knode", "arep", "di_job", "di_blob", "di_fact_adjudication", "di_fact_adjudication_event",
 )
 #: (table, extra-policy-name) exceptions to "tenant_isolation is the only policy" — reserved here,
 #: before the durable-queue upgrade lands, so the posture guard never needs to change shape again.

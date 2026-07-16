@@ -162,7 +162,17 @@ class Settings(BaseSettings):
 
     # --- Ontology ---
     # Stamped into provenance + merged facts so a fact's vintage is identifiable after changes.
-    ontology_version: str = "1.0.0"
+    # NOTE: bumping this default is a no-op wherever ONTOLOGY_VERSION is pinned in the environment
+    # (env vars always win over the default) — vintage auditability relies on deployments actually
+    # rolling the env value forward, not on this default alone.
+    ontology_version: str = "1.1.0"
+    # Deployment-scoped HMAC key for multi-valued-fact instance fingerprints (see
+    # di.subtree.merge.instance_fingerprint). Unsalted SHA-256 lets anyone with API access
+    # dictionary-confirm a low-entropy value (a director's name) against a masked response; HMAC
+    # closes that inference channel. Rotation is deliberately unsupported in v1 — rotating this
+    # key changes every existing instance_key, silently orphaning every adjudication keyed on the
+    # old fingerprints. di.posture requires this set in production.
+    instance_fingerprint_hmac_key: str = ""
 
     # --- Blob storage: where the raw uploaded bytes live ---
     # postgres = bytea in di_blob | local = filesystem/docker volume | s3 = S3/MinIO | none = don't retain

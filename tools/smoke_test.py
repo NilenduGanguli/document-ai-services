@@ -342,6 +342,39 @@ def main() -> int:
               and got[0].get("adjudicated") is True,
               f"value={got[0].get('resolved_value')}")
 
+    # multi-valued-facts adjudication lifecycle (Phase 3): live verdict list, the append-only
+    # history distinct from it, and clearing a verdict to revert to automatic resolution. Exercised
+    # against the single-valued override above — no deterministic extractor produces a
+    # multi-valued attribute (director/beneficial-owner) from the sample fixtures yet, so this
+    # checks the adjudication CRUD lifecycle itself rather than fabricating instance data.
+    r = client.get(f"{BASE}/api/v1/admin/clients/{CLIENT}/adjudications", headers=hdr(),
+                   timeout=10)
+    adjs = r.json() if r.status_code == 200 else []
+    check("GET /admin adjudications lists the live verdict", r.status_code == 200 and any(
+        a.get("attribute_key") == "identity.family_name" and a.get("verdict") == "override"
+        for a in adjs), f"got {r.status_code}")
+
+    r = client.get(f"{BASE}/api/v1/admin/clients/{CLIENT}/adjudications/history",
+                   params={"attribute_key": "identity.family_name"}, headers=hdr(), timeout=10)
+    history = r.json() if r.status_code == 200 else []
+    check("GET /admin adjudications/history records the verdict", r.status_code == 200 and any(
+        e.get("verdict") == "override" for e in history), f"got {r.status_code}")
+
+    r = client.delete(f"{BASE}/api/v1/admin/clients/{CLIENT}/adjudications/identity.family_name",
+                      headers=hdr(), timeout=20)
+    clear = r.json() if r.status_code == 200 else {}
+    check("DELETE /admin adjudications clears the verdict", r.status_code == 200
+          and clear.get("cleared") is True, f"got {r.status_code} {r.text[:100]}")
+    r = client.get(f"{BASE}/api/v1/clients/{CLIENT}/facts",
+                   params={"attribute_key": "identity.family_name", "mask": "false"},
+                   headers=hdr(), timeout=10)
+    reverted = r.json().get("facts", [])
+    if reverted:
+        check("  clearing the verdict reverts to automatic resolution",
+              reverted[0].get("resolved_value") != "SMITH-CORRECTED"
+              and reverted[0].get("adjudicated") is False,
+              f"value={reverted[0].get('resolved_value')}")
+
     if not args.keep:
         r = client.post(f"{BASE}/api/v1/admin/clients/{CLIENT}/purge",
                         json={"confirm_client_id": CLIENT}, headers=hdr(), timeout=60)

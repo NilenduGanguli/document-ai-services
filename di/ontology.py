@@ -53,6 +53,23 @@ ATTRIBUTE_KEYS: dict[str, str] = {
     "doc.expiry_date": "Document expiry/validity date",
 }
 
+# Attributes that may legitimately hold several concurrent values per client (multiple directors,
+# multiple beneficial owners, multiple accounts). Everything not listed is single-valued —
+# fail-closed to the existing one-row-per-attribute behavior unless a key is explicitly promoted
+# here. Promoting a key later requires migrating/voiding its instance_key='' adjudications (see
+# di/subtree/merge.py) — it is not a purely additive change for already-adjudicated clients.
+MULTI_VALUED_ATTRIBUTE_KEYS: frozenset[str] = frozenset({
+    "ownership.director",
+    "ownership.beneficial_owner",
+    "ownership.authorized_signer",
+    "account.number",
+})
+
+
+def cardinality_for(attribute_key: str) -> str:
+    """``'multi'`` | ``'single'``. Unknown keys default to ``'single'``."""
+    return "multi" if attribute_key in MULTI_VALUED_ATTRIBUTE_KEYS else "single"
+
 
 @dataclass(frozen=True)
 class DocTypeSpec:

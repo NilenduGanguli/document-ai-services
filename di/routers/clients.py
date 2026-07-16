@@ -104,7 +104,14 @@ async def get_facts(
     mask: bool | None = None,
     principal: Principal = Depends(require_scope("read")),  # noqa: B008
 ) -> FactsResponse:
-    """Merged client-level facts. ``verified_only`` means independently verified, not self-scored."""
+    """Merged client-level facts. ``verified_only`` means independently verified, not self-scored.
+
+    Each row carries ``instance_key`` ('' for single-valued attributes) and ``instance_count``.
+    Multi-valued attributes (see ``di.ontology.MULTI_VALUED_ATTRIBUTE_KEYS`` — directors,
+    beneficial owners, authorized signers, account numbers) may return several rows sharing one
+    ``attribute_key``; a consumer building a map keyed on ``attribute_key`` alone will silently
+    drop all but one instance. Single-valued attributes are unaffected: exactly one row, as before.
+    """
     authorize_client(principal, client_id)
     masked = _mask_default(mask)
     request.state.audit_masked = masked

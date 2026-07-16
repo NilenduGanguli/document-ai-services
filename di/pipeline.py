@@ -14,7 +14,7 @@ from typing import Any
 import anyio
 
 import di.extract.deterministic  # noqa: F401 - import side-effect registers extractors
-from di import observability, serving, store
+from di import observability, ontology, serving, store
 from di.config import get_settings
 from di.db import pgvector_available
 from di.extract import base as extract_base
@@ -103,18 +103,22 @@ async def _remerge_client_facts(client_id: str) -> int:
     ]
     adj_rows = await store.fetch_adjudications(client_id)
     adjudications = {
-        r["attribute_key"]: merge.Adjudication(
-            attribute_key=r["attribute_key"], verdict=r["verdict"], value_text=r.get("value_text"),
+        (r["attribute_key"], r.get("instance_key") or ""): merge.Adjudication(
+            attribute_key=r["attribute_key"], instance_key=r.get("instance_key") or "",
+            verdict=r["verdict"], value_text=r.get("value_text"),
             value_date=r.get("value_date"), value_num=r.get("value_num"),
             reviewer=r.get("reviewer"), note=r.get("note"),
         )
         for r in adj_rows
     }
+    settings = get_settings()
     merged = merge.merge_facts(
         inputs, client_id=client_id, adjudications=adjudications,
-        ontology_version=get_settings().ontology_version,
+        ontology_version=settings.ontology_version,
+        multi_keys=ontology.MULTI_VALUED_ATTRIBUTE_KEYS,
+        fingerprint_hmac_key=settings.instance_fingerprint_hmac_key,
     )
-    await store.upsert_merged_facts(merged)
+    await store.replace_merged_facts(client_id, merged)
     return len(merged)
 
 

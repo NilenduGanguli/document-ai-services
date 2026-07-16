@@ -218,6 +218,10 @@ class ARep(BaseModel):
 class ClientFact(BaseModel):
     client_id: str
     attribute_key: str
+    #: '' for single-valued attributes (the sentinel — never NULL, so it can sit in a unique
+    #: index); a deterministic value-fingerprint for multi-valued attributes, letting several
+    #: concurrent instances (e.g. three directors) coexist under the same attribute_key.
+    instance_key: str = ""
     resolved_value: str | None = None
     value_date: date | None = None
     value_num: float | None = None

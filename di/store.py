@@ -249,65 +249,160 @@ async def insert_areps(reps: list[ARep]) -> None:
         await conn.executemany(sql, [_row(r) for r in reps])
 
 
-async def upsert_merged_facts(facts: list[ClientFact]) -> None:
-    """Persist the merged client view, including the winner's verification + resolution evidence."""
-    if not facts:
-        return
+async def replace_merged_facts(client_id: str, facts: list[ClientFact]) -> None:
+    """Persist the merged client view as the FULL, authoritative set for this client.
+
+    This is a full-set REPLACE, not an upsert: INSERT/UPDATE every fact in ``facts`` (which may be
+    empty), then DELETE every merged row for the client that is not in that set. Any future caller
+    passing a partial fact set would silently delete the rest — every current caller (the ingest
+    pipeline's re-merge, hence also admin adjudicate/delete-document) already computes the full
+    client set from scratch, so this contract is safe today.
+
+    An empty ``facts`` list deletes every merged row for the client — e.g. after a client's last
+    document is deleted, there is no merged view left to have. This is intentional: the previous
+    upsert-only behavior left orphaned rows forever in that case (deleting a document never removed
+    its now-derived-from-nothing merged facts), which this full-set replace also happens to fix.
+
+    Serializes concurrent re-merges of the SAME client with a per-client advisory transaction lock
+    (released automatically at commit/rollback): two ingests finishing close together for one
+    client — already possible today at ``ingest_concurrency`` > 1 on a single instance, and
+    cross-replica once the durable queue lands — must not let a stale snapshot's DELETE race a
+    newer commit and silently drop the newer document's facts/instances.
+    """
     s = _schema()
-    async with acquire(facts[0].client_id) as conn:
-        await conn.executemany(
-            f'INSERT INTO "{s}".client_merged_fact '
-            "(id, client_id, attribute_key, resolved_value, value_date, value_num, confidence, "
-            " conflict, needs_review, source_fact_ids, verification_status, winning_fact_id, "
-            " resolution_rationale, ontology_version, adjudicated) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) "
-            "ON CONFLICT (client_id, attribute_key) DO UPDATE SET "
-            " resolved_value=EXCLUDED.resolved_value, value_date=EXCLUDED.value_date, "
-            " value_num=EXCLUDED.value_num, confidence=EXCLUDED.confidence, "
-            " conflict=EXCLUDED.conflict, needs_review=EXCLUDED.needs_review, "
-            " source_fact_ids=EXCLUDED.source_fact_ids, "
-            " verification_status=EXCLUDED.verification_status, "
-            " winning_fact_id=EXCLUDED.winning_fact_id, "
-            " resolution_rationale=EXCLUDED.resolution_rationale, "
-            " ontology_version=EXCLUDED.ontology_version, adjudicated=EXCLUDED.adjudicated, "
-            " updated_at=now()",
-            [(str(uuid.uuid4()), f.client_id, f.attribute_key, f.resolved_value, f.value_date,
-              f.value_num, f.confidence, f.conflict, f.needs_review,
-              [uuid.UUID(x) for x in f.source_fact_ids],
-              f.verification_status.value if f.verification_status else None,
-              uuid.UUID(f.winning_fact_id) if f.winning_fact_id else None,
-              f.resolution_rationale or {}, f.ontology_version, f.adjudicated) for f in facts],
-        )
+    async with acquire(client_id) as conn, conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", f"{s}:{client_id}")
+        if facts:
+            await conn.executemany(
+                f'INSERT INTO "{s}".client_merged_fact '
+                "(id, client_id, attribute_key, instance_key, resolved_value, value_date, "
+                " value_num, confidence, conflict, needs_review, source_fact_ids, "
+                " verification_status, winning_fact_id, resolution_rationale, ontology_version, "
+                " adjudicated) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) "
+                "ON CONFLICT (client_id, attribute_key, instance_key) DO UPDATE SET "
+                " resolved_value=EXCLUDED.resolved_value, value_date=EXCLUDED.value_date, "
+                " value_num=EXCLUDED.value_num, confidence=EXCLUDED.confidence, "
+                " conflict=EXCLUDED.conflict, needs_review=EXCLUDED.needs_review, "
+                " source_fact_ids=EXCLUDED.source_fact_ids, "
+                " verification_status=EXCLUDED.verification_status, "
+                " winning_fact_id=EXCLUDED.winning_fact_id, "
+                " resolution_rationale=EXCLUDED.resolution_rationale, "
+                " ontology_version=EXCLUDED.ontology_version, adjudicated=EXCLUDED.adjudicated, "
+                " updated_at=now()",
+                [(str(uuid.uuid4()), f.client_id, f.attribute_key, f.instance_key,
+                  f.resolved_value, f.value_date, f.value_num, f.confidence, f.conflict,
+                  f.needs_review, [uuid.UUID(x) for x in f.source_fact_ids],
+                  f.verification_status.value if f.verification_status else None,
+                  uuid.UUID(f.winning_fact_id) if f.winning_fact_id else None,
+                  f.resolution_rationale or {}, f.ontology_version, f.adjudicated)
+                 for f in facts],
+            )
+            await conn.execute(
+                f'DELETE FROM "{s}".client_merged_fact WHERE client_id = $1 '
+                "AND NOT EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[]) AS keep(a, i) "
+                "WHERE keep.a = attribute_key AND keep.i = instance_key)",
+                client_id, [f.attribute_key for f in facts], [f.instance_key for f in facts],
+            )
+        else:
+            await conn.execute(
+                f'DELETE FROM "{s}".client_merged_fact WHERE client_id = $1', client_id)
 
 
 # ---------------------------------------------------------------------------
 # Human adjudication (survives re-merge)
 # ---------------------------------------------------------------------------
 async def fetch_adjudications(client_id: str) -> list[dict[str, Any]]:
+    """The current LIVE verdict per (attribute_key, instance_key) — mutable; a second verdict on
+    the same instance overwrites this row. For the durable append-only history see
+    :func:`fetch_adjudication_events`."""
     s = _schema()
     async with acquire(client_id) as conn:
         return [dict(r) for r in await conn.fetch(
             f'SELECT * FROM "{s}".di_fact_adjudication WHERE client_id = $1', client_id)]
 
 
-async def upsert_adjudication(client_id: str, *, attribute_key: str, verdict: str,
-                              value_text: str | None = None, value_date: Any = None,
+async def upsert_adjudication(client_id: str, *, attribute_key: str, instance_key: str = "",
+                              verdict: str, value_text: str | None = None, value_date: Any = None,
                               value_num: float | None = None, reviewer: str | None = None,
                               note: str | None = None) -> None:
-    """Record a reviewer's decision for an attribute. Re-merge reapplies it, so it is not lost."""
+    """Record a reviewer's decision for an attribute/instance. Re-merge reapplies it, so it is not
+    lost. The live row (di_fact_adjudication) is mutable and overwritten by a later verdict on the
+    same instance — ``updated_at`` tracks that, ``created_at`` is never touched again after the
+    first write. di_fact_adjudication_event is the durable, append-only compliance record of every
+    verdict ever recorded for this instance, written in the same transaction so the two can never
+    diverge.
+    """
     s = _schema()
-    async with acquire(client_id) as conn:
+    async with acquire(client_id) as conn, conn.transaction():
         await conn.execute(
             f'INSERT INTO "{s}".di_fact_adjudication '
-            "(id, client_id, attribute_key, verdict, value_text, value_date, value_num, reviewer, "
-            " note) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) "
-            "ON CONFLICT (client_id, attribute_key) DO UPDATE SET "
+            "(id, client_id, attribute_key, instance_key, verdict, value_text, value_date, "
+            " value_num, reviewer, note) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) "
+            "ON CONFLICT (client_id, attribute_key, instance_key) DO UPDATE SET "
             " verdict=EXCLUDED.verdict, value_text=EXCLUDED.value_text, "
             " value_date=EXCLUDED.value_date, value_num=EXCLUDED.value_num, "
-            " reviewer=EXCLUDED.reviewer, note=EXCLUDED.note, created_at=now()",
-            str(uuid.uuid4()), client_id, attribute_key, verdict, value_text, value_date,
-            value_num, reviewer, note,
+            " reviewer=EXCLUDED.reviewer, note=EXCLUDED.note, updated_at=now()",
+            str(uuid.uuid4()), client_id, attribute_key, instance_key, verdict, value_text,
+            value_date, value_num, reviewer, note,
         )
+        await conn.execute(
+            f'INSERT INTO "{s}".di_fact_adjudication_event '
+            "(client_id, attribute_key, instance_key, verdict, value_text, value_date, "
+            " value_num, reviewer, note) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            client_id, attribute_key, instance_key, verdict, value_text, value_date, value_num,
+            reviewer, note,
+        )
+
+
+async def clear_adjudication(client_id: str, *, attribute_key: str, instance_key: str = "",
+                             reviewer: str | None = None, note: str | None = None) -> bool:
+    """Remove a live verdict so the next re-merge falls back to automatic resolution.
+
+    Needed because reject is otherwise a one-way door for multi-valued instances: a reject deletes
+    the merged row, and the adjudicate endpoint's existence check would then 404 on every
+    subsequent attempt to fix a wrongly-rejected instance. Records a 'cleared' event in the
+    append-only history — clearing a verdict is itself an auditable decision, not an erasure of
+    what happened.
+
+    Returns:
+        ``False`` if there was no live verdict to clear (nothing changed).
+    """
+    s = _schema()
+    async with acquire(client_id) as conn, conn.transaction():
+        deleted = await conn.fetchval(
+            f'DELETE FROM "{s}".di_fact_adjudication '
+            "WHERE client_id = $1 AND attribute_key = $2 AND instance_key = $3 RETURNING 1",
+            client_id, attribute_key, instance_key,
+        )
+        if deleted is None:
+            return False
+        await conn.execute(
+            f'INSERT INTO "{s}".di_fact_adjudication_event '
+            "(client_id, attribute_key, instance_key, verdict, reviewer, note) "
+            "VALUES ($1,$2,$3,'cleared',$4,$5)",
+            client_id, attribute_key, instance_key, reviewer, note,
+        )
+        return True
+
+
+async def fetch_adjudication_events(client_id: str, *, attribute_key: str | None = None,
+                                    instance_key: str | None = None) -> list[dict[str, Any]]:
+    """The durable, append-only compliance record: every verdict ever recorded for this client
+    (across every attribute/instance, or narrowed to one), newest first."""
+    s = _schema()
+    conds = ["client_id = $1"]
+    params: list[Any] = [client_id]
+    if attribute_key:
+        params.append(attribute_key)
+        conds.append(f"attribute_key = ${len(params)}")
+    if instance_key is not None:
+        params.append(instance_key)
+        conds.append(f"instance_key = ${len(params)}")
+    sql = (f'SELECT * FROM "{s}".di_fact_adjudication_event WHERE ' + " AND ".join(conds) +
+           " ORDER BY created_at DESC, id DESC")
+    async with acquire(client_id) as conn:
+        return [dict(r) for r in await conn.fetch(sql, *params)]
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +509,7 @@ async def fetch_merged_facts(client_id: str, *, attribute_key: str | None = None
     if attribute_key:
         params.append(attribute_key)
         sql += f" AND attribute_key = ${len(params)}"
-    sql += " ORDER BY attribute_key"
+    sql += " ORDER BY attribute_key, instance_key"
     async with acquire(client_id) as conn:
         return [dict(r) for r in await conn.fetch(sql, *params)]
 
@@ -514,7 +609,16 @@ async def delete_document(client_id: str, doc_id: str) -> dict[str, int]:
 
 
 async def purge_client(client_id: str) -> dict[str, int]:
-    """Erase every trace of a tenant (off-boarding / right-to-erasure). Irreversible."""
+    """Erase every trace of a tenant (off-boarding / right-to-erasure). Irreversible.
+
+    ``di_fact_adjudication_event`` and ``di_access_log`` are deliberately absent: both are
+    append-only compliance audit trails (blocked from DELETE by trigger — including either here
+    would abort the whole purge transaction), and KYC/AML recordkeeping obligations require
+    retaining a record of who decided what, and who accessed what, independent of the underlying
+    tenant data's lifecycle. Their retention/export is a separate, time-boxed process (see
+    ``di.tools.audit_export`` for the access-log precedent); an adjudication-event equivalent is
+    future work, not required for this purge path to be correct.
+    """
     s = _schema()
     tables = ("arep", "knode", "doc_version", "client_merged_fact", "di_fact_adjudication",
               "di_decision_trace", "di_entity", "di_job", "di_blob", "di_documents")
@@ -689,11 +793,11 @@ async def hybrid_search(client_id: str, *, query_text: str, query_embedding: lis
 
 # expose for callers that need the live dim
 __all__ = [
-    "clamp_limit", "create_version", "decode_cursor", "delete_document", "embedding_dim",
-    "encode_cursor", "fetch_access_log", "fetch_adjudications", "fetch_areps",
-    "fetch_client_facts", "fetch_merged_facts", "fetch_node", "fetch_subtree",
-    "fetch_tenant_policy", "find_document", "get_current_version", "get_document",
+    "clamp_limit", "clear_adjudication", "create_version", "decode_cursor", "delete_document",
+    "embedding_dim", "encode_cursor", "fetch_access_log", "fetch_adjudication_events",
+    "fetch_adjudications", "fetch_areps", "fetch_client_facts", "fetch_merged_facts", "fetch_node",
+    "fetch_subtree", "fetch_tenant_policy", "find_document", "get_current_version", "get_document",
     "hybrid_search", "insert_areps", "insert_document", "insert_knodes", "list_documents",
-    "list_version_changes", "purge_client", "record_decision_trace", "upsert_adjudication",
-    "upsert_merged_facts", "upsert_tenant_policy",
+    "list_version_changes", "purge_client", "record_decision_trace", "replace_merged_facts",
+    "upsert_adjudication", "upsert_tenant_policy",
 ]

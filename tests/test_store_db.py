@@ -74,13 +74,16 @@ async def test_store_round_trip():
         assert hits, "expected at least the chunk to match"
         assert hits[0]["_rank"] == 1
 
-        # merged fact upsert (idempotent on conflict)
+        # merged fact replace (idempotent on conflict; a repeat call with the same full set must
+        # not raise, and must not delete the row it just wrote)
         cf = ClientFact(client_id=cid, attribute_key="id.passport_number",
                         resolved_value="X1234567", confidence=0.95, source_fact_ids=[fact.id])
-        await store.upsert_merged_facts([cf])
-        await store.upsert_merged_facts([cf])  # second time must not raise
+        await store.replace_merged_facts(cid, [cf])
+        await store.replace_merged_facts(cid, [cf])
+        merged = await store.fetch_merged_facts(cid)
+        assert len(merged) == 1 and merged[0]["resolved_value"] == "X1234567"
 
-        docs = await store.list_documents(cid)
+        docs, _next_cursor = await store.list_documents(cid)
         assert any(d["document_name"] == "passport.pdf" for d in docs)
     finally:
         await close_pool()

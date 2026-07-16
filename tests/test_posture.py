@@ -16,6 +16,7 @@ def _settings(**overrides) -> Settings:
         "pg_migration_user": "di_owner", "pg_user": "di_app",
         "auth_enabled": True, "mask_by_default": True, "di_bootstrap_api_key": "",
         "access_audit_enabled": True, "access_audit_strict": True,
+        "instance_fingerprint_hmac_key": "a-deployment-scoped-secret-from-secret-manager",
     }
     base.update(overrides)
     return Settings(**base)
@@ -91,6 +92,18 @@ def test_empty_bootstrap_key_is_clean() -> None:
     """Empty is the RECOMMENDED prod value — the CLI mints the first real key."""
     violations = evaluate_static_posture(_settings(di_bootstrap_api_key=""))
     assert violations == []
+
+
+def test_missing_fingerprint_hmac_key_is_a_violation() -> None:
+    violations = evaluate_static_posture(_settings(instance_fingerprint_hmac_key=""))
+    assert any("INSTANCE_FINGERPRINT_HMAC_KEY" in v for v in violations)
+
+
+def test_set_fingerprint_hmac_key_is_clean() -> None:
+    violations = evaluate_static_posture(
+        _settings(instance_fingerprint_hmac_key="a-deployment-scoped-secret")
+    )
+    assert not any("INSTANCE_FINGERPRINT_HMAC_KEY" in v for v in violations)
 
 
 def test_access_audit_disabled_is_a_violation() -> None:

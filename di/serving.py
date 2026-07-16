@@ -117,8 +117,20 @@ def is_verified(row: dict[str, Any]) -> bool:
 
 def project_facts(rows: list[dict[str, Any]], *, mask: bool = False,
                   verified_only: bool = False) -> list[dict[str, Any]]:
-    """Project merged-fact rows, deriving sensitivity (from the attribute key) and a 'verified'
-    flag (independent verification + no conflict); optionally filter and/or mask values."""
+    """Project merged-fact rows, deriving sensitivity (from the attribute key), a 'verified' flag
+    (independent verification + no conflict), and ``instance_count`` (siblings sharing an
+    attribute_key — always 1 for single-valued attributes); optionally filter and/or mask values.
+
+    ``instance_count`` is computed over the PRE-filter row set: computing it after a
+    ``verified_only``/masking filter would undercount an attribute whose sibling instances have
+    mixed verification status (e.g. 2 of 3 directors verified) and give reviewers a misleading
+    "how many instances exist" signal.
+    """
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = row.get("attribute_key")
+        counts[key] = counts.get(key, 0) + 1
+
     out: list[dict[str, Any]] = []
     for row in rows:
         verified = is_verified(row)
@@ -126,6 +138,7 @@ def project_facts(rows: list[dict[str, Any]], *, mask: bool = False,
             continue
         item = dict(row)
         item["verified"] = verified
+        item["instance_count"] = counts.get(row.get("attribute_key"), 1)
         sensitivity = sensitivity_for_key(row.get("attribute_key"))
         item["sensitivity"] = sensitivity
         if mask and sensitivity in _MASKABLE:
@@ -135,6 +148,12 @@ def project_facts(rows: list[dict[str, Any]], *, mask: bool = False,
             item["value_date"] = None
             item["value_num"] = None
             item["masked"] = True
+            # resolution_rationale.identity_basis (multi-valued facts) is the cleartext
+            # normalized value an instance was fingerprinted from — e.g. a director's full
+            # name — and rides through untouched otherwise, defeating the redaction above.
+            rationale = item.get("resolution_rationale")
+            if isinstance(rationale, dict) and "identity_basis" in rationale:
+                item["resolution_rationale"] = {**rationale, "identity_basis": "***"}
         out.append(item)
     return out
 
@@ -144,7 +163,7 @@ def sensitivity_for_key(attribute_key: str | None) -> str:
     key = attribute_key or ""
     if key.startswith("id."):
         return SensitivityBucket.critical.value
-    if key.startswith(("identity.", "address.", "income.", "account.")):
+    if key.startswith(("identity.", "address.", "income.", "account.", "ownership.")):
         return SensitivityBucket.high.value
     return SensitivityBucket.low.value
 

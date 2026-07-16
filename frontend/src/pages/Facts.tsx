@@ -2,10 +2,19 @@
  * Facts — the merged, client-level resolved view.
  *
  * A fact can be sourced from several documents; `source_fact_ids` links back to
- * the underlying nodes, each of which carries its own provenance.
+ * the underlying nodes, each of which carries its own provenance. Multi-valued
+ * attributes (directors, beneficial owners, authorized signers, account numbers
+ * — see `di.ontology.MULTI_VALUED_ATTRIBUTE_KEYS`) may return several rows
+ * sharing one `attribute_key`, distinguished by `instance_key`; those rows are
+ * grouped visually and carry an "N instances" badge on the first row.
  */
 import { useMemo, useState } from 'react';
-import { getFacts } from '../lib/api';
+import {
+  adjudicate,
+  ApiError,
+  clearAdjudication,
+  getFacts,
+} from '../lib/api';
 import { humanize } from '../lib/format';
 import { useAsync } from '../hooks/useAsync';
 import { useApiKey, useClientId, useMask } from '../hooks/useSettings';
@@ -16,6 +25,10 @@ import { IconFacts, IconRefresh } from '../components/Icons';
 import { ProvenanceDrawer } from '../components/ProvenanceDrawer';
 import { EmptyState, ErrorState, NeedsClient, NeedsKey, SkeletonTable } from '../components/States';
 
+function factRowKey(f: MergedFact): string {
+  return `${f.attribute_key}:${f.instance_key ?? ''}`;
+}
+
 export function Facts(): JSX.Element {
   const [clientId] = useClientId();
   const [apiKey] = useApiKey();
@@ -25,6 +38,9 @@ export function Facts(): JSX.Element {
   const [filter, setFilter] = useState('');
   const [sourcesFor, setSourcesFor] = useState<MergedFact | null>(null);
   const [provNode, setProvNode] = useState<string | null>(null);
+  const [adjBusy, setAdjBusy] = useState(false);
+  const [adjError, setAdjError] = useState<string | null>(null);
+  const [overrideValue, setOverrideValue] = useState('');
 
   const enabled = !!clientId && !!apiKey;
   const { data, error, loading, reload } = useAsync(
@@ -44,6 +60,57 @@ export function Facts(): JSX.Element {
     );
   }, [data, filter]);
 
+  // Facts arrive sorted by (attribute_key, instance_key); mark the first row of each run so
+  // only it carries the attribute label + instance-count badge, and siblings render indented.
+  const rows = useMemo(() => {
+    let prevKey: string | null = null;
+    return facts.map((f) => {
+      const isFirst = f.attribute_key !== prevKey;
+      prevKey = f.attribute_key;
+      return { fact: f, isFirst };
+    });
+  }, [facts]);
+
+  async function runAdjudication(
+    f: MergedFact,
+    verdict: 'accept' | 'reject' | 'override',
+    valueText?: string,
+  ): Promise<void> {
+    setAdjBusy(true);
+    setAdjError(null);
+    try {
+      await adjudicate({
+        clientId,
+        attributeKey: f.attribute_key,
+        instanceKey: f.instance_key ?? '',
+        verdict,
+        valueText,
+        reviewer: 'console',
+      });
+      setSourcesFor(null);
+      setOverrideValue('');
+      await reload();
+    } catch (err) {
+      setAdjError(err instanceof ApiError ? err.friendly : 'Adjudication failed.');
+    } finally {
+      setAdjBusy(false);
+    }
+  }
+
+  async function runClear(f: MergedFact): Promise<void> {
+    setAdjBusy(true);
+    setAdjError(null);
+    try {
+      await clearAdjudication(clientId, f.attribute_key, f.instance_key ?? '');
+      setSourcesFor(null);
+      await reload();
+    } catch (err) {
+      setAdjError(err instanceof ApiError ? err.friendly : 'Clearing the verdict failed.');
+    } finally {
+      setAdjBusy(false);
+    }
+  }
+
   if (!clientId) return <main className="page"><NeedsClient /></main>;
   if (!apiKey) return <main className="page"><NeedsKey /></main>;
 
@@ -53,8 +120,9 @@ export function Facts(): JSX.Element {
         <div>
           <h1 className="page-title">Merged facts</h1>
           <p className="page-sub">
-            One resolved value per attribute for <code>{clientId}</code>, merged across every
-            document. Conflicts and low-confidence values are flagged for review.
+            One resolved value per attribute (or per instance, for directors/beneficial owners/
+            accounts) for <code>{clientId}</code>, merged across every document. Conflicts and
+            low-confidence values are flagged for review.
           </p>
         </div>
         <div className="toolbar">
@@ -126,13 +194,27 @@ export function Facts(): JSX.Element {
                 </tr>
               </thead>
               <tbody>
-                {facts.map((f) => {
+                {rows.map(({ fact: f, isFirst }) => {
                   const sources = f.source_fact_ids ?? [];
+                  const instanceCount = f.instance_count ?? 1;
                   return (
-                    <tr key={f.attribute_key}>
+                    <tr key={factRowKey(f)}>
                       <td>
-                        <div className="cell-strong mono">{f.attribute_key}</div>
-                        <div className="cell-muted">{humanize(f.attribute_key)}</div>
+                        {isFirst ? (
+                          <>
+                            <div className="cell-strong mono row" style={{ gap: 6 }}>
+                              {f.attribute_key}
+                              {instanceCount > 1 && (
+                                <Badge tone="neutral">{instanceCount} instances</Badge>
+                              )}
+                            </div>
+                            <div className="cell-muted">{humanize(f.attribute_key)}</div>
+                          </>
+                        ) : (
+                          <div className="cell-muted mono" style={{ paddingLeft: 16 }}>
+                            ↳ instance
+                          </div>
+                        )}
                       </td>
                       <td>
                         <span className="mono">{f.resolved_value ?? '—'}</span>
@@ -150,6 +232,7 @@ export function Facts(): JSX.Element {
                       <td>
                         <div className="row" style={{ gap: 5 }}>
                           {f.verified && <Badge tone="green">verified</Badge>}
+                          {f.adjudicated && <Badge tone="info">adjudicated</Badge>}
                           {f.conflict && (
                             <Badge tone="red" title="Sources disagree on this value.">
                               conflict
@@ -161,26 +244,25 @@ export function Facts(): JSX.Element {
                             </Badge>
                           )}
                           {f.masked && <Badge tone="neutral">masked</Badge>}
-                          {!f.verified && !f.conflict && !f.needs_review && !f.masked && (
-                            <span className="cell-muted">—</span>
-                          )}
+                          {!f.verified && !f.conflict && !f.needs_review && !f.masked
+                            && !f.adjudicated && <span className="cell-muted">—</span>}
                         </div>
                       </td>
                       <td>
                         <SensitivityBadge value={f.sensitivity} />
                       </td>
                       <td>
-                        {sources.length > 0 ? (
-                          <button
-                            type="button"
-                            className="btn btn-sm"
-                            onClick={() => setSourcesFor(f)}
-                          >
-                            {sources.length} source{sources.length === 1 ? '' : 's'}
-                          </button>
-                        ) : (
-                          <span className="cell-muted">—</span>
-                        )}
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          onClick={() => {
+                            setAdjError(null);
+                            setOverrideValue(f.resolved_value ?? '');
+                            setSourcesFor(f);
+                          }}
+                        >
+                          {sources.length} source{sources.length === 1 ? '' : 's'}
+                        </button>
                       </td>
                     </tr>
                   );
@@ -191,12 +273,16 @@ export function Facts(): JSX.Element {
         )}
       </section>
 
-      {/* Source picker → provenance */}
+      {/* Source picker + adjudication → provenance */}
       <Drawer
         open={!!sourcesFor && !provNode}
         onClose={() => setSourcesFor(null)}
         title={sourcesFor?.attribute_key ?? 'Sources'}
-        subtitle="Select a source node to see its provenance"
+        subtitle={
+          sourcesFor?.instance_key
+            ? `instance ${sourcesFor.instance_key} — ${sourcesFor.resolved_value ?? '(no value)'}`
+            : 'Select a source node to see its provenance'
+        }
       >
         <div className="section-label">Resolved value</div>
         <div className="prov-grid">
@@ -206,6 +292,61 @@ export function Facts(): JSX.Element {
           <span className="prov-val">
             <ConfidenceBar value={sourcesFor?.confidence} />
           </span>
+        </div>
+
+        <div className="section-label">Adjudicate</div>
+        {adjError && (
+          <div className="cell-muted" style={{ color: 'var(--danger, #c0392b)', marginBottom: 8 }}>
+            {adjError}
+          </div>
+        )}
+        <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={adjBusy}
+            onClick={() => sourcesFor && runAdjudication(sourcesFor, 'accept')}
+          >
+            Accept
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm btn-danger"
+            disabled={adjBusy}
+            onClick={() => sourcesFor && runAdjudication(sourcesFor, 'reject')}
+            title={
+              sourcesFor?.instance_key
+                ? 'Removes this instance from the merged view (reversible via Clear verdict).'
+                : 'Nulls the value and flags it for review.'
+            }
+          >
+            Reject
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={adjBusy || !sourcesFor?.adjudicated}
+            onClick={() => sourcesFor && runClear(sourcesFor)}
+            title="Remove the verdict so the next re-merge falls back to automatic resolution."
+          >
+            Clear verdict
+          </button>
+        </div>
+        <div className="row" style={{ gap: 6, marginTop: 8 }}>
+          <input
+            className="input input-inline"
+            value={overrideValue}
+            onChange={(e) => setOverrideValue(e.target.value)}
+            placeholder="corrected value…"
+          />
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={adjBusy || !overrideValue.trim()}
+            onClick={() => sourcesFor && runAdjudication(sourcesFor, 'override', overrideValue.trim())}
+          >
+            Override
+          </button>
         </div>
 
         <div className="section-label">

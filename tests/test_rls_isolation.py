@@ -121,11 +121,21 @@ async def _seed_tenant(owner: asyncpg.Connection, schema: str, client_id: str) -
         f"VALUES (gen_random_uuid(), $1, 'id.test', 'accept')",
         client_id,
     )
+    await owner.execute(
+        f'INSERT INTO "{schema}".di_fact_adjudication_event '
+        f"(client_id, attribute_key, instance_key, verdict) VALUES ($1, 'id.test', '', 'accept')",
+        client_id,
+    )
 
 
 async def _cleanup_tenant(owner: asyncpg.Connection, schema: str, client_id: str) -> None:
+    """DELETE every seeded row, EXCEPT di_fact_adjudication_event: it is append-only by trigger
+    (same as purge_client in di/store.py deliberately skips it) — a stray audit row from a
+    randomly-generated test client_id is harmless and cannot be cleaned up by design."""
     await _bind(owner, client_id)
     for table in _TENANT_TABLES:
+        if table == "di_fact_adjudication_event":
+            continue
         await owner.execute(f'DELETE FROM "{schema}".{table} WHERE client_id = $1', client_id)
 
 
