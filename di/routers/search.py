@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
 from di import observability, serving, store
@@ -41,6 +41,7 @@ class SearchResponse(BaseModel):
 
 @router.post("/clients/{client_id}/search", response_model=SearchResponse)
 async def search(
+    request: Request,
     client_id: str, req: SearchRequest,
     principal: Principal = Depends(require_scope("read")),  # noqa: B008
 ) -> SearchResponse:
@@ -48,6 +49,7 @@ async def search(
     authorize_client(principal, client_id)
     settings = get_settings()
     masked = settings.mask_by_default if req.mask is None else req.mask
+    request.state.audit_masked = masked
     top_k = min(req.top_k, settings.max_top_k)
     started = time.perf_counter()
 

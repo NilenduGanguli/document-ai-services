@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from di import serving, store
@@ -81,6 +81,7 @@ class AnswerableResponse(BaseModel):
 # --------------------------------------------------------------------------- routes
 @router.get("/{client_id}/tree", response_model=TreeResponse)
 async def get_tree(
+    request: Request,
     client_id: str, doc_id: str | None = None, path: str | None = None,
     max_depth: int | None = Query(None, ge=1, le=32),  # noqa: B008
     current_only: bool = True, mask: bool | None = None,
@@ -89,6 +90,7 @@ async def get_tree(
     """Nested knowledge subtree for a client (optionally scoped to a document or path)."""
     authorize_client(principal, client_id)
     masked = _mask_default(mask)
+    request.state.audit_masked = masked
     rows = await store.fetch_subtree(client_id, doc_id=doc_id, path_prefix=path,
                                      max_depth=max_depth, current_only=current_only)
     return TreeResponse(client_id=client_id, count=len(rows), masked=masked,
@@ -97,6 +99,7 @@ async def get_tree(
 
 @router.get("/{client_id}/facts", response_model=FactsResponse)
 async def get_facts(
+    request: Request,
     client_id: str, attribute_key: str | None = None, verified_only: bool = False,
     mask: bool | None = None,
     principal: Principal = Depends(require_scope("read")),  # noqa: B008
@@ -104,6 +107,7 @@ async def get_facts(
     """Merged client-level facts. ``verified_only`` means independently verified, not self-scored."""
     authorize_client(principal, client_id)
     masked = _mask_default(mask)
+    request.state.audit_masked = masked
     rows = await store.fetch_merged_facts(client_id, attribute_key=attribute_key)
     facts = serving.project_facts(rows, mask=masked, verified_only=verified_only)
     return FactsResponse(client_id=client_id, count=len(facts), masked=masked, facts=facts)

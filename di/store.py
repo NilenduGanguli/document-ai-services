@@ -529,6 +529,74 @@ async def purge_client(client_id: str) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# Tenant policy (global — read at admission, before any tenant GUC is bound)
+# ---------------------------------------------------------------------------
+async def fetch_tenant_policy(client_id: str) -> dict[str, Any] | None:
+    """Fetch a tenant's operational-policy overrides (ingest quotas). Global table, no RLS: the
+    ingest admission check runs this BEFORE it has decided whether the caller is even authorized
+    for the tenant's data, so it must not depend on a bound GUC."""
+    s = _schema()
+    async with acquire(None) as conn:
+        row = await conn.fetchrow(
+            f'SELECT * FROM "{s}".di_tenant_policy WHERE client_id = $1', client_id)
+    return dict(row) if row else None
+
+
+async def upsert_tenant_policy(client_id: str, *, max_active_jobs: int | None,
+                               daily_ingest_limit: int | None,
+                               note: str | None = None) -> dict[str, Any]:
+    """Create or update a tenant's policy overrides. ``None`` for a limit means "use the fleet
+    default", not "unlimited" — see di.config's ingest_max_active_jobs_per_client /
+    ingest_daily_limit_per_client."""
+    s = _schema()
+    async with acquire(None) as conn:
+        row = await conn.fetchrow(
+            f'INSERT INTO "{s}".di_tenant_policy '
+            "(client_id, max_active_jobs, daily_ingest_limit, note) "
+            "VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT (client_id) DO UPDATE SET "
+            " max_active_jobs=EXCLUDED.max_active_jobs, "
+            " daily_ingest_limit=EXCLUDED.daily_ingest_limit, note=EXCLUDED.note, "
+            " updated_at=now() "
+            "RETURNING *",
+            client_id, max_active_jobs, daily_ingest_limit, note,
+        )
+    return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Access log query (admin: "who read this client's data?")
+# ---------------------------------------------------------------------------
+async def fetch_access_log(*, client_id: str | None, limit: int = 50, cursor: str | None = None,
+                           ) -> tuple[list[dict[str, Any]], str | None]:
+    """Keyset-paginated read of di_access_log, mirroring di.jobs' cursor shape.
+
+    Global table (no RLS) — always runs on ``acquire(None)``. ``client_id=None`` returns the
+    unfiltered fleet-wide log; the caller (admin router) is responsible for requiring a wildcard
+    tenant grant before allowing that.
+    """
+    s = _schema()
+    conds: list[str] = []
+    params: list[Any] = []
+    if client_id:
+        params.append(client_id)
+        conds.append(f"client_id = ${len(params)}")
+    if cursor:
+        ts, cid = decode_cursor(cursor)
+        params.extend([ts, cid])
+        conds.append(f"(ts, id) < (${len(params) - 1}::timestamptz, ${len(params)}::bigint)")
+    where = f"WHERE {' AND '.join(conds)}" if conds else ""
+    sql = (f'SELECT * FROM "{s}".di_access_log {where} '
+           f"ORDER BY ts DESC, id DESC LIMIT {clamp_limit(limit) + 1}")
+    async with acquire(None) as conn:
+        rows = [dict(r) for r in await conn.fetch(sql, *params)]
+    has_more = len(rows) > clamp_limit(limit)
+    page = rows[: clamp_limit(limit)]
+    next_cursor = encode_cursor(page[-1]["ts"], str(page[-1]["id"])) if has_more and page else None
+    return page, next_cursor
+
+
+# ---------------------------------------------------------------------------
 # Hybrid search (index-many / return-parent, RRF fusion, vector-optional)
 # ---------------------------------------------------------------------------
 def _rrf(rankings: list[list[str]], k: int = 60) -> dict[str, float]:
@@ -622,9 +690,10 @@ async def hybrid_search(client_id: str, *, query_text: str, query_embedding: lis
 # expose for callers that need the live dim
 __all__ = [
     "clamp_limit", "create_version", "decode_cursor", "delete_document", "embedding_dim",
-    "encode_cursor", "fetch_adjudications", "fetch_areps", "fetch_client_facts",
-    "fetch_merged_facts", "fetch_node", "fetch_subtree", "find_document", "get_current_version",
-    "get_document", "hybrid_search", "insert_areps", "insert_document", "insert_knodes",
-    "list_documents", "list_version_changes", "purge_client", "record_decision_trace",
-    "upsert_adjudication", "upsert_merged_facts",
+    "encode_cursor", "fetch_access_log", "fetch_adjudications", "fetch_areps",
+    "fetch_client_facts", "fetch_merged_facts", "fetch_node", "fetch_subtree",
+    "fetch_tenant_policy", "find_document", "get_current_version", "get_document",
+    "hybrid_search", "insert_areps", "insert_document", "insert_knodes", "list_documents",
+    "list_version_changes", "purge_client", "record_decision_trace", "upsert_adjudication",
+    "upsert_merged_facts", "upsert_tenant_policy",
 ]

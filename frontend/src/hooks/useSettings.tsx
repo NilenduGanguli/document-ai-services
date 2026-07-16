@@ -7,14 +7,17 @@ import {
   useRef,
   type ReactNode,
 } from 'react';
-import { API_KEY_STORAGE, setApiKeyGetter } from '../lib/api';
-import { useLocalStorage } from './useLocalStorage';
+import { API_KEY_PERSIST_STORAGE, API_KEY_STORAGE, setApiKeyGetter } from '../lib/api';
+import { useLocalStorage, useStorage } from './useLocalStorage';
 
 export type Theme = 'light' | 'dark';
 
 interface SettingsValue {
   apiKey: string;
   setApiKey: (v: string) => void;
+  /** "Remember key on this device" — true moves the key from sessionStorage to localStorage. */
+  apiKeyPersist: boolean;
+  setApiKeyPersist: (v: boolean) => void;
   clientId: string;
   setClientId: (v: string) => void;
   theme: Theme;
@@ -28,17 +31,75 @@ interface SettingsValue {
 const SettingsContext = createContext<SettingsValue | null>(null);
 
 const KEY_API = API_KEY_STORAGE;
+const KEY_API_PERSIST = API_KEY_PERSIST_STORAGE;
 const KEY_CLIENT = 'di.clientId';
 const KEY_THEME = 'di.theme';
 const KEY_MASK = 'di.mask';
 
 /**
- * App-wide settings (API key, client id, theme, masking) persisted to
- * localStorage and shared through context so a change in the header bar is
- * seen immediately by every page in the same tab.
+ * App-wide settings (API key, client id, theme, masking) shared through
+ * context so a change in the header bar is seen immediately by every page in
+ * the same tab.
+ *
+ * The API key defaults to sessionStorage (gone when the tab closes) rather
+ * than localStorage: a persistent raw credential is exfiltratable by any XSS
+ * and survives shared-workstation sessions. Checking "remember key on this
+ * device" (apiKeyPersist) opts into localStorage for operators who accept
+ * that trade on their own machine. Everything else here (client id, theme,
+ * mask) is non-sensitive and stays in localStorage.
  */
 export function SettingsProvider({ children }: { children: ReactNode }): JSX.Element {
-  const [apiKey, setApiKey] = useLocalStorage(KEY_API, '');
+  const [persistRaw, setPersistRaw] = useLocalStorage(KEY_API_PERSIST, 'false');
+  const apiKeyPersist = persistRaw === 'true';
+
+  const [sessionKey, setSessionKey] = useStorage(KEY_API, '', sessionStorage);
+  const [localKey, setLocalKey] = useStorage(KEY_API, '', localStorage);
+
+  // One-time migration on mount: this app used to persist the key in localStorage
+  // unconditionally. Drop any stale value left over from before sessionStorage became the
+  // default, unless the operator has explicitly opted into persistence.
+  const migrated = useRef(false);
+  if (!migrated.current) {
+    migrated.current = true;
+    if (!apiKeyPersist) {
+      try {
+        localStorage.removeItem(KEY_API);
+      } catch {
+        // best-effort
+      }
+    }
+  }
+
+  const apiKey = apiKeyPersist ? localKey : sessionKey;
+  const setApiKey = useCallback(
+    (v: string) => (apiKeyPersist ? setLocalKey(v) : setSessionKey(v)),
+    [apiKeyPersist, setLocalKey, setSessionKey],
+  );
+  const setApiKeyPersist = useCallback(
+    (v: boolean) => {
+      setPersistRaw(v ? 'true' : 'false');
+      if (v) {
+        // Moving to persistent storage: carry the current session value over.
+        setLocalKey(sessionKey);
+        try {
+          sessionStorage.removeItem(KEY_API);
+        } catch {
+          // best-effort
+        }
+      } else {
+        // Moving back to session-only: carry the current persisted value over, then drop it
+        // from localStorage so it doesn't outlive the tab after all.
+        setSessionKey(localKey);
+        try {
+          localStorage.removeItem(KEY_API);
+        } catch {
+          // best-effort
+        }
+      }
+    },
+    [setPersistRaw, setLocalKey, setSessionKey, sessionKey, localKey],
+  );
+
   const [clientId, setClientId] = useLocalStorage(KEY_CLIENT, '');
   const [themeRaw, setThemeRaw] = useLocalStorage(
     KEY_THEME,
@@ -83,6 +144,8 @@ export function SettingsProvider({ children }: { children: ReactNode }): JSX.Ele
     () => ({
       apiKey,
       setApiKey,
+      apiKeyPersist,
+      setApiKeyPersist,
       clientId,
       setClientId,
       theme,
@@ -91,7 +154,19 @@ export function SettingsProvider({ children }: { children: ReactNode }): JSX.Ele
       mask,
       setMask,
     }),
-    [apiKey, setApiKey, clientId, setClientId, theme, setTheme, toggleTheme, mask, setMask],
+    [
+      apiKey,
+      setApiKey,
+      apiKeyPersist,
+      setApiKeyPersist,
+      clientId,
+      setClientId,
+      theme,
+      setTheme,
+      toggleTheme,
+      mask,
+      setMask,
+    ],
   );
 
   return <SettingsContext.Provider value={value}>{children}</SettingsContext.Provider>;
@@ -103,10 +178,16 @@ function useSettings(): SettingsValue {
   return ctx;
 }
 
-/** The operator's API key, persisted in localStorage. */
+/** The operator's API key. sessionStorage by default; see `useApiKeyPersist` to opt into localStorage. */
 export function useApiKey(): [string, (v: string) => void] {
   const { apiKey, setApiKey } = useSettings();
   return [apiKey, setApiKey];
+}
+
+/** "Remember key on this device" — persists the API key to localStorage instead of sessionStorage. */
+export function useApiKeyPersist(): [boolean, (v: boolean) => void] {
+  const { apiKeyPersist, setApiKeyPersist } = useSettings();
+  return [apiKeyPersist, setApiKeyPersist];
 }
 
 /** The active client id (RLS tenant scope), persisted in localStorage. */

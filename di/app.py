@@ -9,6 +9,7 @@ probe.
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,9 +19,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from di import auth, ingest_runner, observability, posture
+from di import audit, auth, ingest_runner, observability, posture
+from di.audit import AccessRecord, AuditUnavailable, resolve_audit_client_id
 from di.config import get_settings
 from di.db import (
+    access_log_partition_horizon_months,
     assert_rls_posture,
     close_pool,
     init_pool,
@@ -50,6 +53,28 @@ class _HashedStatic(StaticFiles):
         return resp
 
 
+def _csp_header() -> str:
+    """CSP for the SPA shell, derived from the actual built bundle (frontend/index.html +
+    frontend/public/theme-init.js) rather than a generic template:
+
+    - script-src 'self' — the bundle has no inline <script>; the pre-paint theme-setter lives in
+      the same-origin theme-init.js precisely so this can stay strict.
+    - style-src 'self' 'unsafe-inline' — React's `style={}` props render as inline `style`
+      attributes; there is no practical per-element nonce/hash story for those, so this is the one
+      deliberate loosening.
+    - img-src 'self' data: — the favicon is an inlined `data:image/svg+xml` URI.
+    - connect-src 'self' — all API calls are same-origin (frontend/src/lib/api.ts).
+
+    Verified against the built console (must render, not blank) before enabling in
+    tools/smoke_test.py — a bundle change that adds a new origin needs to update this function.
+    """
+    return (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; "
+        "base-uri 'self'; frame-ancestors 'none'"
+    )
+
+
 def _mount_frontend(app: FastAPI) -> None:
     """Serve the SPA from frontend/dist: /assets (immutable), / (index), SPA fallback; /api/* 404s."""
     dist, index, assets = _FRONTEND_DIST, _FRONTEND_DIST / "index.html", _FRONTEND_DIST / "assets"
@@ -61,7 +86,10 @@ def _mount_frontend(app: FastAPI) -> None:
 
     def _index() -> FileResponse:
         # never cache the shell, so a new build's hashed asset refs are picked up on reload
-        return FileResponse(index, media_type="text/html", headers={"cache-control": "no-cache"})
+        return FileResponse(
+            index, media_type="text/html",
+            headers={"cache-control": "no-cache", "content-security-policy": _csp_header()},
+        )
 
     @app.get("/", include_in_schema=False)
     async def _root() -> FileResponse:
@@ -191,9 +219,32 @@ async def _startup() -> None:
         READINESS.set("auth", True, "DISABLED — every /api/v1 route is open", enabled=False)
         logger.warning("AUTH IS DISABLED (auth_enabled=false): all API routes are unauthenticated")
 
+    if settings.access_audit_enabled:
+        audit.start_writer()
+        try:
+            horizon = await access_log_partition_horizon_months(settings)
+            ok = horizon >= 1
+            READINESS.set("audit", ok,
+                          f"writer started; partition horizon {horizon} month(s)" if ok else
+                          f"partition horizon is only {horizon} month(s) — re-run migrations",
+                          horizon_months=horizon, strict=settings.access_audit_strict)
+        except Exception as exc:  # noqa: BLE001
+            READINESS.set("audit", False, f"partition horizon check failed: {exc}")
+            logger.exception("could not check access-log partition horizon")
+    else:
+        READINESS.set("audit", True, "DISABLED — no read-side access audit is recorded",
+                      enabled=False)
+
+    # In strict mode a stalled writer must drain the replica (503 behind a green /readyz would
+    # otherwise route traffic into guaranteed audit-unavailable 503s) — add it to the required
+    # set only then, so non-strict/local deployments are never gated on audit health.
+    if settings.access_audit_strict and "audit" not in observability.REQUIRED_COMPONENTS:
+        observability.REQUIRED_COMPONENTS = (*observability.REQUIRED_COMPONENTS, "audit")
+
 
 async def _shutdown() -> None:
     await ingest_runner.drain()
+    await audit.stop_writer()
     await close_pool()
 
 
@@ -251,6 +302,61 @@ def create_app() -> FastAPI:
         """Prometheus exposition: gate decisions, LLM egress, stage timings, ingest outcomes."""
         payload, content_type = observability.metrics_response()
         return Response(content=payload, media_type=content_type)
+
+    @app.middleware("http")
+    async def _access_audit_middleware(request: Request, call_next):
+        """Read-side access audit — "who read this client's data, and did they see it masked?"
+
+        Only requests that resolve to a tenant ``client_id`` are recorded (health/metrics/console
+        assets are not). Routing has already happened by the time ``call_next`` returns, so
+        ``request.scope["route"]``/``path_params`` are read AFTER it, not before (Starlette
+        populates them during dispatch, which happens inside ``call_next`` for this middleware
+        style). HTTPException-based auth failures (401/403/429) come back as normal responses
+        here — Starlette's ExceptionMiddleware, which sits closer to routing than this
+        middleware, already converted them — so they are recorded with their real status; only a
+        genuinely unhandled exception propagates as a raise, which is caught, recorded as a 500,
+        and re-raised so the app's own exception handler still produces the response.
+        """
+        if not settings.access_audit_enabled:
+            return await call_next(request)
+        request_id = str(uuid.uuid4())
+        try:
+            response = await call_next(request)
+        except Exception:
+            await _record_access_attempt(request, request_id, 500)
+            raise
+        override = await _record_access_attempt(request, request_id, response.status_code)
+        return override or response
+
+    async def _record_access_attempt(request: Request, request_id: str, status: int,
+                                      ) -> Response | None:
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", None)
+        if not route_path or not route_path.startswith("/api/"):
+            return None
+        path_params = request.scope.get("path_params") or {}
+        client_id = resolve_audit_client_id(
+            path_params, request.query_params, getattr(request.state, "audit_client_id", None)
+        )
+        if not client_id:
+            return None
+        principal = getattr(request.state, "principal", None)
+        record = AccessRecord(
+            method=request.method, route=route_path, status=status,
+            key_id=principal.key_id if principal else None,
+            principal=principal.name if principal else None,
+            client_id=client_id,
+            masked=getattr(request.state, "audit_masked", None),
+            request_id=request_id,
+        )
+        try:
+            await audit.record_access(record)
+        except AuditUnavailable:
+            # Fail closed: the real response was already computed but is discarded here — the
+            # client never sees it. The synchronous stdout log line was already emitted inside
+            # record_access, so this request is not entirely unaudited even in this path.
+            return JSONResponse({"detail": "audit unavailable"}, status_code=503)
+        return None
 
     # Routers are included lazily so a partially-implemented tree still boots.
     from di.routers import admin, clients, ingest, jobs, nodes, search

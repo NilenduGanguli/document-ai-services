@@ -59,6 +59,23 @@ services:
       # --- and the smoke test use. Rotate/replace it for anything beyond a local demo.
       AUTH_ENABLED: "true"
       DI_BOOTSTRAP_API_KEY: "di_local_dev_key_change_me"
+      KEY_ROTATION_OVERLAP_HOURS: "24"
+
+      # --- Rate limiting (per-process backstop) ---
+      RATE_LIMIT_ENABLED: "true"
+      RATE_LIMIT_DEFAULT_RPS: "50"
+      RATE_LIMIT_BURST: "100"
+      AUTH_FAILURE_CACHE_SECONDS: "5"
+
+      # --- Per-tenant ingest quotas ---
+      INGEST_MAX_ACTIVE_JOBS_PER_CLIENT: "25"
+      INGEST_DAILY_LIMIT_PER_CLIENT: "0"
+
+      # --- Read-side access audit. Strict stays off for the demo so a slow/absent writer never
+      # --- turns a local run into an outage; production sets this true (enforced by di/posture.py).
+      ACCESS_AUDIT_ENABLED: "true"
+      ACCESS_AUDIT_STRICT: "false"
+      ACCESS_AUDIT_RETENTION_DAYS: "400"
 
       # --- Blob storage: where the raw uploaded bytes live.
       # postgres (default) | local (docker volume at /data/blobs) | s3 (MinIO below) | none

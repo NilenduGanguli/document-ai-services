@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { NavLink, Outlet, useLocation } from 'react-router-dom';
-import { useApiKey, useClientId, useTheme } from '../hooks/useSettings';
+import { useApiKey, useApiKeyPersist, useClientId, useTheme } from '../hooks/useSettings';
 import {
   IconAdmin,
   IconDashboard,
@@ -74,6 +74,7 @@ function NavGroup({
 function HeaderBar({ onToggleSidebar }: { onToggleSidebar: () => void }): JSX.Element {
   const [clientId, setClientId] = useClientId();
   const [apiKey, setApiKey] = useApiKey();
+  const [apiKeyPersist, setApiKeyPersist] = useApiKeyPersist();
   const { theme, toggle } = useTheme();
   const [showKey, setShowKey] = useState(false);
 
@@ -127,6 +128,15 @@ function HeaderBar({ onToggleSidebar }: { onToggleSidebar: () => void }): JSX.El
             {showKey ? <IconEyeOff size={14} /> : <IconEye size={14} />}
           </button>
         </span>
+      </label>
+
+      <label className="field-inline" title="Keep the key in this browser's storage after the tab closes">
+        <input
+          type="checkbox"
+          checked={apiKeyPersist}
+          onChange={(e) => setApiKeyPersist(e.target.checked)}
+        />
+        <span className="field-label">Remember key on this device</span>
       </label>
 
       <span className="topbar-spacer" />

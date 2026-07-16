@@ -411,6 +411,23 @@ textarea.input:focus {
   min-width: 150px;
 }
 
+.field-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.field-inline input[type='checkbox'] {
+  accent-color: var(--accent);
+}
+
+.field-inline .field-label {
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 500;
+}
+
 .key-wrap {
   position: relative;
   display: flex;

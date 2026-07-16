@@ -147,7 +147,7 @@ export function NeedsKey(): JSX.Element {
   return (
     <EmptyState
       title="No API key set"
-      text="Paste your API key into the header bar. It is stored in this browser's localStorage and sent as X-API-KEY on every request."
+      text="Paste your API key into the header bar. It is sent as X-API-KEY on every request and kept for this browser tab only, unless you check “Remember key on this device”."
     />
   );
 }

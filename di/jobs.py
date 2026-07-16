@@ -32,6 +32,7 @@ __all__ = [
     "JobEvent",
     "JobStatus",
     "append_event",
+    "count_active_and_today",
     "create_job",
     "find_by_idempotency",
     "get_job",
@@ -300,6 +301,42 @@ async def set_status(client_id: str, job_id: str, status: JobStatus, *, stage: s
             client_id, uuid.UUID(job_id), status.value, stage, error, _as_uuid(doc_id),
             _as_uuid(version_id), status in _TERMINAL,
         )
+
+
+#: Non-terminal statuses, derived from the enum rather than hardcoded — when a later phase adds
+#: e.g. ``queued``/``dead``/``canceled`` states, "active" tracks them automatically instead of
+#: silently under-counting against a stale literal list.
+_ACTIVE_STATUSES = tuple(s.value for s in JobStatus if s not in _TERMINAL)
+
+
+async def count_active_and_today(client_id: str) -> tuple[int, int]:
+    """Count a tenant's active jobs and jobs created since local midnight — the two numbers the
+    ingest admission quota checks.
+
+    Two separate scalar subqueries (not one query with two ``FILTER`` clauses) so each rides its
+    own index (``di_job_client_status`` for the active count, ``di_job_client_created`` for
+    today's count) rather than forcing one plan to serve both.
+
+    Args:
+        client_id: The owning tenant. Runs under ``acquire(client_id)`` — FORCE RLS means an
+            unbound or wrongly-scoped caller would silently see zero rows and the quota would
+            never trip, so this MUST be called with the tenant GUC bound.
+
+    Returns:
+        ``(active_count, today_count)``.
+    """
+    s = _schema()
+    async with acquire(client_id) as conn:
+        active = await conn.fetchval(
+            f'SELECT count(*) FROM "{s}".di_job WHERE client_id = $1 AND status = ANY($2)',
+            client_id, list(_ACTIVE_STATUSES),
+        )
+        today = await conn.fetchval(
+            f'SELECT count(*) FROM "{s}".di_job '
+            "WHERE client_id = $1 AND created_at >= date_trunc('day', now())",
+            client_id,
+        )
+    return int(active or 0), int(today or 0)
 
 
 async def purge_client_jobs(client_id: str) -> int:

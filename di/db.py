@@ -18,6 +18,7 @@ import logging
 import ssl
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 
 import asyncpg
@@ -313,6 +314,7 @@ async def run_migrations(settings: Settings | None = None, *,
                 await _create_hash_partitions(conn, table, settings.pg_hash_partitions)
 
             await _ensure_vector_columns(conn, settings)
+            await _ensure_access_log_partitions(conn, settings)
         finally:
             await conn.execute("SELECT pg_advisory_unlock($1)", lock_key)
 
@@ -500,3 +502,64 @@ async def _ensure_vector_columns(conn: asyncpg.Connection, settings: Settings) -
                 f'CREATE INDEX IF NOT EXISTS "{table}_p{i}_{col}_hnsw" '
                 f'ON "{schema}"."{table}_p{i}" USING hnsw ({col} vector_cosine_ops);'
             )
+
+
+# ---------------------------------------------------------------------------
+# di_access_log partition management — owner-role DDL only (di/audit.py's writer never does DDL)
+# ---------------------------------------------------------------------------
+def month_partition_name(month: date) -> str:
+    return "di_access_log_" + month.strftime("%Y_%m")
+
+
+def add_months(d: date, n: int) -> date:
+    month0 = d.month - 1 + n
+    year = d.year + month0 // 12
+    month = month0 % 12 + 1
+    return date(year, month, 1)
+
+
+async def _ensure_access_log_partitions(conn: asyncpg.Connection, settings: Settings) -> None:
+    """Create this month's + ``access_audit_partition_months_ahead`` future partitions.
+
+    Runs under the owner connection inside :func:`run_migrations`'s advisory lock, so concurrent
+    replicas cannot race the DDL. A no-op if migration 007 (which creates the parent table) has
+    not been applied yet — lets this be called unconditionally without ordering assumptions.
+    """
+    schema = settings.pg_schema
+    exists = await conn.fetchval("SELECT to_regclass($1)", f'"{schema}".di_access_log')
+    if exists is None:
+        return
+    today = date.today().replace(day=1)
+    for i in range(settings.access_audit_partition_months_ahead + 1):
+        month = add_months(today, i)
+        name = month_partition_name(month)
+        next_month = add_months(month, 1)
+        # CREATE TABLE ... PARTITION OF is DDL: Postgres does not accept bind parameters for the
+        # partition bounds, so the (internally computed, never user-supplied) dates are inlined.
+        await conn.execute(
+            f'CREATE TABLE IF NOT EXISTS "{schema}"."{name}" '
+            f'PARTITION OF "{schema}".di_access_log '
+            f"FOR VALUES FROM ('{month.isoformat()}') TO ('{next_month.isoformat()}');"
+        )
+
+
+async def access_log_partition_horizon_months(settings: Settings | None = None) -> int:
+    """Return how many consecutive future months (from the current month, inclusive) already have
+    a ``di_access_log`` partition. Used by readiness to alert before the writer runs out."""
+    settings = settings or get_settings()
+    pool = await init_pool(settings)
+    schema = settings.pg_schema
+    async with pool.acquire() as conn:
+        month = date.today().replace(day=1)
+        count = 0
+        while True:
+            exists = await conn.fetchval(
+                "SELECT to_regclass($1)", f'"{schema}".{month_partition_name(month)}'
+            )
+            if exists is None:
+                break
+            count += 1
+            month = add_months(month, 1)
+            if count > 240:  # pragma: no cover - defensive bound, ~20 years
+                break
+    return count

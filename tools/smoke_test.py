@@ -18,6 +18,7 @@ import io
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -119,7 +120,7 @@ def main() -> int:
           f"degraded={ready.get('degraded')}")
     comps = ready.get("components", {})
     for name in ("db", "migrations", "posture", "rls", "pgvector", "retrieval", "blob", "ocr",
-                 "auth"):
+                 "auth", "audit"):
         c = comps.get(name, {})
         check(f"  component {name}", bool(c.get("ok")),
               f"{c.get('detail','')} {c.get('extra','')}".strip())
@@ -277,6 +278,53 @@ def main() -> int:
     check("GET /jobs paginates", r.status_code == 200 and len(jl.get("jobs", [])) == 1,
           f"next_cursor={'set' if jl.get('next_cursor') else 'none'}")
 
+    # ---------------------------------------------------------------- auth hardening (Phase 2)
+    print("\nauth hardening")
+
+    # key rotation: mint a throwaway key, rotate it, prove the successor is live and the
+    # predecessor is now time-boxed (not immediately dead — an overlap window).
+    r = client.post(f"{BASE}/api/v1/admin/keys", headers=hdr(),
+                    json={"name": "smoke-rotate", "client_ids": [CLIENT], "scopes": ["read"]},
+                    timeout=10)
+    check("POST /admin/keys creates a key", r.status_code == 201 and "api_key" in r.json(),
+          f"got {r.status_code}")
+    old_key_id = r.json().get("key_id")
+    r = client.post(f"{BASE}/api/v1/admin/keys/{old_key_id}/rotate", headers=hdr(), json={},
+                    timeout=10)
+    rot = r.json()
+    check("POST /admin/keys/{id}/rotate mints a successor", r.status_code == 200
+          and "api_key" in rot and "old_key_expires_at" in rot, f"got {r.status_code} {rot}")
+    r = client.get(f"{BASE}/api/v1/clients/{CLIENT}/facts",
+                   headers={"X-API-KEY": rot.get("api_key", "")}, timeout=10)
+    check("  rotated (successor) key authenticates", r.status_code == 200, f"got {r.status_code}")
+    r = client.get(f"{BASE}/api/v1/admin/keys", headers=hdr(), timeout=10)
+    listed = next((k for k in r.json() if k["id"] == rot.get("key_id")), None)
+    check("  successor key lists with rotated_from set",
+          bool(listed) and listed.get("rotated_from") == old_key_id, str(listed))
+
+    # per-tenant ingest quota: an explicit daily_ingest_limit=0 override blocks the tenant
+    # entirely — a deliberate admin lever, distinct from the fleet default's 0 (= unlimited).
+    quota_client = f"{CLIENT}-QUOTA"
+    r = client.put(f"{BASE}/api/v1/admin/tenants/{quota_client}/policy", headers=hdr(),
+                   json={"daily_ingest_limit": 0}, timeout=10)
+    check("PUT /admin/tenants/{id}/policy sets an override", r.status_code == 200
+          and r.json().get("daily_ingest_limit") == 0, f"got {r.status_code} {r.text[:120]}")
+    files = {"file": ("passport.pdf", io.BytesIO(pdf), "application/pdf")}
+    data_q = {"client_id": quota_client, "external_document_id": "EXT-QUOTA-1",
+              "idempotency_key": "smoke-quota-1"}
+    r = client.post(f"{BASE}/api/v1/ingest", data=data_q, files=files, headers=hdr(), timeout=30)
+    check("  blocked tenant's ingest -> 429", r.status_code == 429, f"got {r.status_code}")
+    r = client.put(f"{BASE}/api/v1/admin/tenants/{quota_client}/policy", headers=hdr(), json={},
+                   timeout=10)
+    check("  clearing the policy override succeeds", r.status_code == 200, f"got {r.status_code}")
+
+    # read-side access audit: the requests made throughout this run should show up for CLIENT.
+    r = client.get(f"{BASE}/api/v1/admin/access-log", params={"client_id": CLIENT, "limit": 5},
+                   headers=hdr(), timeout=10)
+    al = r.json()
+    check("GET /admin/access-log", r.status_code == 200 and al.get("count", 0) > 0,
+          f"count={al.get('count')}")
+
     # ---------------------------------------------------------------- admin
     print("\nadmin / lifecycle")
     r = client.post(f"{BASE}/api/v1/admin/clients/{CLIENT}/adjudicate",
@@ -301,6 +349,23 @@ def main() -> int:
               str(r.json().get("deleted"))[:120])
         r = client.get(f"{BASE}/api/v1/clients/{CLIENT}/documents", headers=hdr(), timeout=10)
         check("  tenant data is gone", r.json().get("count") == 0)
+
+    # ---------------------------------------------------------------- rate limit (runs LAST:
+    # deliberately exhausts the bootstrap key's token bucket, which would 429-starve every check
+    # above if it ran earlier)
+    print("\nrate limit")
+
+    def _one_get() -> httpx.Response:
+        return httpx.get(f"{BASE}/api/v1/clients/{CLIENT}/facts", headers=hdr(), timeout=10)
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        burst = list(pool.map(lambda _: _one_get(), range(200)))
+    throttled = [r for r in burst if r.status_code == 429]
+    check("concurrent burst trips the rate limiter", len(throttled) > 0,
+          f"{len(throttled)}/{len(burst)} got 429")
+    if throttled:
+        check("  429 carries Retry-After", "retry-after" in throttled[0].headers,
+              dict(throttled[0].headers))
 
     # ---------------------------------------------------------------- report
     total = len(_results)

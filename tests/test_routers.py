@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from di import store
 from di.auth import Principal
@@ -17,6 +18,11 @@ from di.routers import clients, nodes, search
 def _principal(client_ids: list[str] | None = None) -> Principal:
     return Principal(key_id="test-key", name="test", client_ids=client_ids or ["*"],
                      scopes=["*"])
+
+
+def _request() -> Request:
+    """A minimal ASGI request — just enough for handlers that stash request.state.audit_masked."""
+    return Request({"type": "http", "method": "GET", "path": "/", "headers": []})
 
 
 def _knode(nid, parent, ntype, **kw):
@@ -43,7 +49,7 @@ async def test_get_tree_nests_and_masks(monkeypatch):
         return rows
 
     monkeypatch.setattr(store, "fetch_subtree", fake_fetch_subtree)
-    res = await clients.get_tree("c1", mask=True, principal=_principal())
+    res = await clients.get_tree(_request(), "c1", mask=True, principal=_principal())
     assert res.count == 2
     assert res.masked is True
     root = res.tree[0]
@@ -55,7 +61,8 @@ async def test_get_tree_nests_and_masks(monkeypatch):
 async def test_get_tree_denies_other_tenants(monkeypatch):
     """A principal scoped to one client cannot read another's tree."""
     with pytest.raises(HTTPException) as ei:
-        await clients.get_tree("other-client", principal=_principal(client_ids=["c1"]))
+        await clients.get_tree(_request(), "other-client",
+                               principal=_principal(client_ids=["c1"]))
     assert ei.value.status_code == 403
 
 
@@ -70,7 +77,8 @@ async def test_get_facts_verified_only(monkeypatch):
         ]
 
     monkeypatch.setattr(store, "fetch_merged_facts", fake)
-    res = await clients.get_facts("c1", verified_only=True, mask=False, principal=_principal())
+    res = await clients.get_facts(_request(), "c1", verified_only=True, mask=False,
+                                  principal=_principal())
     assert res.count == 1 and res.facts[0]["attribute_key"] == "id.ssn"
 
 
@@ -84,7 +92,8 @@ async def test_get_facts_excludes_high_confidence_llm_fact(monkeypatch):
         ]
 
     monkeypatch.setattr(store, "fetch_merged_facts", fake)
-    res = await clients.get_facts("c1", verified_only=True, mask=False, principal=_principal())
+    res = await clients.get_facts(_request(), "c1", verified_only=True, mask=False,
+                                  principal=_principal())
     assert res.count == 0
 
 
@@ -121,7 +130,7 @@ async def test_search_returns_ranked_hits(monkeypatch):
     monkeypatch.setattr(search, "pgvector_available", fake_pgvector)
     monkeypatch.setattr(store, "hybrid_search", fake_hybrid)
     req = search.SearchRequest(query="passport", top_k=5, mask=False)
-    res = await search.search("c1", req, principal=_principal())
+    res = await search.search(_request(), "c1", req, principal=_principal())
     assert res.count == 1 and res.hits[0]["_rank"] == 1
     assert res.vector is False
 

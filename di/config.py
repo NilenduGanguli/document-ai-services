@@ -5,17 +5,60 @@ No secrets are hard-coded; everything comes from the environment / ``.env``.
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic.fields import FieldInfo
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+
+
+class _FileSecretSource(PydanticBaseSettingsSource):
+    """Read a field's value from a file when ``<ENV_NAME>_FILE`` is set.
+
+    Maps cleanly onto how secrets actually arrive in production: GCP Secret Manager via Cloud
+    Run's ``--set-secrets`` writes a mounted file (or, more commonly on this team, injects the
+    plain env var directly — both work, this covers the file-mount case); Kubernetes secret
+    volumes and Vault agent sinks are files by convention. Lower priority than a literal env var
+    (see ``settings_customise_sources``) so ``PG_PASSWORD=x PG_PASSWORD_FILE=/secrets/pg``
+    resolves predictably to the explicit value.
+    """
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        env_name = (field.alias or field_name).upper()
+        path = os.environ.get(f"{env_name}_FILE")
+        if not path:
+            return None, field_name, False
+        try:
+            return Path(path).read_text(encoding="utf-8").strip(), field_name, False
+        except OSError as exc:
+            raise ValueError(f"{env_name}_FILE={path!r} could not be read: {exc}") from exc
+
+    def __call__(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for field_name, field in self.settings_cls.model_fields.items():
+            value, key, _ = self.get_field_value(field, field_name)
+            if value is not None:
+                result[key] = value
+        return result
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings,
+    ):
+        # Precedence (highest first): explicit init kwargs > real env vars > _FILE indirection >
+        # .env file > pydantic-settings' own secrets_dir mechanism (unused here, kept for parity).
+        return (init_settings, env_settings, _FileSecretSource(settings_cls), dotenv_settings,
+                file_secret_settings)
 
     # --- App ---
     app_name: str = "document-intelligence"
@@ -62,8 +105,35 @@ class Settings(BaseSettings):
     # --- AuthN / AuthZ ---
     # Disable ONLY for a local demo; every /api/v1 route is unauthenticated when false.
     auth_enabled: bool = True
-    # Seeds a wildcard key at startup so a fresh container is usable from env alone.
+    # Seeds a wildcard key at startup so a fresh container is usable from env alone. Production
+    # must leave this unset — see di/posture.py — and mint its first key via `python -m di.tools.keys`.
     di_bootstrap_api_key: str = ""
+    key_rotation_overlap_hours: int = 24
+
+    # --- Rate limiting (per-process backstop; exact global limits belong to the bank's gateway) ---
+    rate_limit_enabled: bool = True
+    rate_limit_default_rps: float = 50.0
+    rate_limit_burst: int = 100
+    # Failed-auth (unknown/invalid key) backstop: a short negative-result cache so a credential-
+    # stuffing flood cannot hammer di_api_key with one uncacheable lookup per request.
+    auth_failure_cache_seconds: float = 5.0
+
+    # --- Per-tenant ingest quotas (admission-time fairness; di_tenant_policy overrides per client) ---
+    ingest_max_active_jobs_per_client: int = 25
+    ingest_daily_limit_per_client: int = 0     # 0 = unlimited
+
+    # --- Read-side access audit ---
+    access_audit_enabled: bool = True
+    # Prod posture requires this true (see di/posture.py): a stalled writer then 503s reads rather
+    # than silently dropping audit records — "no audit -> no reads" is a deliberate compliance
+    # trade a bank must accept explicitly. Local/dev default false so a slow/absent DB never turns
+    # a demo into an outage.
+    access_audit_strict: bool = False
+    access_audit_queue_max: int = 10_000
+    access_audit_batch: int = 500
+    access_audit_flush_ms: int = 1000
+    access_audit_retention_days: int = 400
+    access_audit_partition_months_ahead: int = 3
 
     # --- Gate / pipeline ---
     gate_default_open: bool = True

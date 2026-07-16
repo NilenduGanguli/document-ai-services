@@ -41,7 +41,11 @@ def _request(headers: dict[str, str] | None = None) -> Request:
 
 def _stub_settings(monkeypatch: pytest.MonkeyPatch, **kwargs) -> None:
     """Point di.auth at stub settings and make any DB access an error."""
-    defaults = {"auth_enabled": True, "di_bootstrap_api_key": "", "pg_schema": "di"}
+    defaults = {
+        "auth_enabled": True, "di_bootstrap_api_key": "", "pg_schema": "di",
+        "rate_limit_enabled": True, "rate_limit_default_rps": 50.0, "rate_limit_burst": 100,
+        "auth_failure_cache_seconds": 5.0,
+    }
     settings = SimpleNamespace(**{**defaults, **kwargs})
     monkeypatch.setattr(auth, "get_settings", lambda: settings)
 
@@ -250,6 +254,150 @@ async def test_expired_cache_entry_is_not_served(monkeypatch):
 async def test_revoke_rejects_malformed_uuid_without_db(monkeypatch):
     _stub_settings(monkeypatch, auth_enabled=True)
     assert await auth.revoke_api_key("not-a-uuid") is False
+
+
+# ---------------------------------------------------------------------------
+# Expiry-aware caching (Phase 2: key lifecycle)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_cached_principal_past_its_own_expiry_window_falls_through_to_db(monkeypatch):
+    """A cache entry seeded with a short custom TTL (simulating an expiring key) must not be
+    served past that TTL even though CACHE_TTL_SECONDS is longer."""
+    _stub_settings(monkeypatch, auth_enabled=True)
+    raw = "di_expiring-key"
+    principal = Principal(key_id="k1", name="n", client_ids=["acme"], scopes=["read"])
+    # Cached with an expiry 1s in the past (as resolve_principal would compute for a key whose
+    # expires_at had already passed the cache write).
+    auth._cache[hash_key(raw)] = (auth.time.monotonic() - 1.0, principal)
+    with pytest.raises(AssertionError):  # must re-check the DB, not serve the stale grant
+        await auth.resolve_principal(raw)
+
+
+# ---------------------------------------------------------------------------
+# Failed-auth backstop
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_resolve_principal_short_circuits_on_backstop_without_db(monkeypatch):
+    from di import ratelimit
+
+    _stub_settings(monkeypatch, auth_enabled=True)
+    raw = "di_known-bad-key"
+    ratelimit.record_auth_failure(hash_key(raw))
+    try:
+        assert await auth.resolve_principal(raw) is None  # no AssertionError -> DB never touched
+    finally:
+        ratelimit.reset()
+
+
+@pytest.mark.asyncio
+async def test_unknown_key_records_a_failure_for_the_backstop(monkeypatch):
+    from di import ratelimit
+
+    ratelimit.reset()
+    settings = SimpleNamespace(
+        auth_enabled=True, di_bootstrap_api_key="", pg_schema="di",
+        rate_limit_enabled=True, rate_limit_default_rps=50.0, rate_limit_burst=100,
+        auth_failure_cache_seconds=5.0,
+    )
+    monkeypatch.setattr(auth, "get_settings", lambda: settings)
+
+    class _FakeConn:
+        async def fetchrow(self, *a, **kw):
+            return None
+
+    class _FakeAcquire:
+        def __init__(self, client_id=None):
+            pass
+
+        async def __aenter__(self):
+            return _FakeConn()
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(auth, "acquire", _FakeAcquire)
+    raw = "di_never-issued"
+    try:
+        assert await auth.resolve_principal(raw) is None
+        assert ratelimit.check_failed_auth_backstop(hash_key(raw)) is True
+    finally:
+        ratelimit.reset()
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting in require_principal
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_require_principal_429s_when_bucket_exhausted(monkeypatch):
+    from fastapi import HTTPException
+
+    from di import ratelimit
+    from di.ratelimit import TokenBucket
+
+    _stub_settings(monkeypatch, auth_enabled=True)
+    raw = "di_rate-limited-key"
+    principal = Principal(key_id="rl-key", name="n", client_ids=["*"], scopes=["*"])
+    auth._cache[hash_key(raw)] = (auth.time.monotonic() + 30.0, principal)
+
+    # rps must match what require_principal will compute (principal.rate_limit_rps or
+    # settings.rate_limit_default_rps=50.0 from _stub_settings) — check_rate_limit replaces a
+    # bucket whose rps no longer matches the caller's effective rate (see
+    # test_rps_change_resets_the_bucket in test_ratelimit.py), so a mismatched seed here would be
+    # silently discarded rather than exercising the 429 path. `now` must also be close to the
+    # REAL time.monotonic() require_principal will use internally (it does not accept an injected
+    # clock) — seeding with now=0.0 would look like eons of idle refill time had passed.
+    real_now = auth.time.monotonic()
+    exhausted = TokenBucket(rps=50.0, burst=1)
+    exhausted.allow(now=real_now)  # consume the only token
+    ratelimit._buckets["rl-key"] = exhausted
+    ratelimit._touched["rl-key"] = real_now
+    try:
+        with pytest.raises(HTTPException) as exc:
+            await require_principal(_request({API_KEY_HEADER: raw}))
+        assert exc.value.status_code == 429
+        assert "Retry-After" in exc.value.headers
+    finally:
+        ratelimit.reset()
+
+
+@pytest.mark.asyncio
+async def test_require_principal_rate_limit_disabled_bypasses_the_bucket(monkeypatch):
+    from di import ratelimit
+    from di.ratelimit import TokenBucket
+
+    _stub_settings(monkeypatch, auth_enabled=True, rate_limit_enabled=False)
+    raw = "di_unlimited-key"
+    principal = Principal(key_id="unlim-key", name="n", client_ids=["*"], scopes=["*"])
+    auth._cache[hash_key(raw)] = (auth.time.monotonic() + 30.0, principal)
+
+    exhausted = TokenBucket(rps=1.0, burst=1)
+    exhausted.allow(now=0.0)
+    ratelimit._buckets["unlim-key"] = exhausted
+    ratelimit._touched["unlim-key"] = 0.0
+    try:
+        result = await require_principal(_request({API_KEY_HEADER: raw}))
+        assert result is principal  # rate_limit_enabled=False -> the exhausted bucket is ignored
+    finally:
+        ratelimit.reset()
+
+
+@pytest.mark.asyncio
+async def test_require_principal_stashes_principal_on_request_state(monkeypatch):
+    _stub_settings(monkeypatch, auth_enabled=True)
+    raw = "di_stash-key"
+    principal = Principal(key_id="k1", name="n", client_ids=["*"], scopes=["*"])
+    auth._cache[hash_key(raw)] = (auth.time.monotonic() + 30.0, principal)
+    req = _request({API_KEY_HEADER: raw})
+    result = await require_principal(req)
+    assert req.state.principal is result
+
+
+@pytest.mark.asyncio
+async def test_require_principal_local_dev_stashes_principal_too(monkeypatch):
+    _stub_settings(monkeypatch, auth_enabled=False)
+    req = _request()
+    result = await require_principal(req)
+    assert req.state.principal is result
 
 
 # ---------------------------------------------------------------------------

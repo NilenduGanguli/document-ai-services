@@ -122,11 +122,17 @@ function isNotJsonObject(body: unknown): boolean {
   return body === null || typeof body !== 'object' || Array.isArray(body);
 }
 
-/** localStorage key holding the operator's API key. Owned here, used by the settings provider. */
+/** Storage key holding the operator's API key. Owned here, used by the settings provider. */
 export const API_KEY_STORAGE = 'di.apiKey';
+/**
+ * localStorage flag ("true"/absent) opting the key above into persistent storage. Default
+ * (absent) keeps the key in sessionStorage — gone when the tab closes, not exfiltratable via a
+ * stored-XSS payload that outlives the session. See useSettings.tsx for the write side.
+ */
+export const API_KEY_PERSIST_STORAGE = 'di.apiKey.persist';
 
 /**
- * Default: read straight from localStorage.
+ * Default: read straight from storage, honoring the persist flag.
  *
  * This must not depend on the React tree having mounted. Child effects run
  * BEFORE parent effects, so a page's first fetch fires before the provider's
@@ -136,7 +142,9 @@ export const API_KEY_STORAGE = 'di.apiKey';
  */
 let apiKeyGetter: () => string = () => {
   try {
-    return localStorage.getItem(API_KEY_STORAGE) ?? '';
+    const persist = localStorage.getItem(API_KEY_PERSIST_STORAGE) === 'true';
+    const store = persist ? localStorage : sessionStorage;
+    return store.getItem(API_KEY_STORAGE) ?? '';
   } catch {
     return '';
   }
