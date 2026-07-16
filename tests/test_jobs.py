@@ -14,6 +14,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from di.jobs import (
+    _ACTIVE_STATUSES,
+    _TERMINAL,
+    ClaimedJob,
     Job,
     JobEvent,
     JobStatus,
@@ -132,7 +135,36 @@ def test_job_status_values():
     assert JobStatus.running.value == "running"
     assert JobStatus.succeeded.value == "succeeded"
     assert JobStatus.failed.value == "failed"
+    assert JobStatus.dead.value == "dead"
+    assert JobStatus.canceled.value == "canceled"
     assert JobStatus("failed") is JobStatus.failed
+
+
+def test_terminal_and_active_sets_partition_every_status():
+    """Every JobStatus value is in exactly one of _TERMINAL / _ACTIVE_STATUSES — the quota's
+    active-job counting derives from this set, so a status that falls through either boundary
+    would silently mis-count admission (see di.routers.ingest._enforce_ingest_quota)."""
+    all_values = {s.value for s in JobStatus}
+    active = set(_ACTIVE_STATUSES)
+    terminal = {s.value for s in _TERMINAL}
+    assert active | terminal == all_values
+    assert active & terminal == set()
+
+
+def test_terminal_set_includes_dead_and_canceled():
+    assert JobStatus.dead in _TERMINAL
+    assert JobStatus.canceled in _TERMINAL
+    assert JobStatus.queued not in _TERMINAL
+    assert JobStatus.running not in _TERMINAL
+
+
+def test_claimed_job_carries_payload_job_does_not():
+    """The public Job model must never carry payload (internal blob URIs/file paths); ClaimedJob
+    (worker-internal only, never serialized to the API) does."""
+    assert "payload" not in Job.model_fields
+    assert "payload" in ClaimedJob.model_fields
+    assert "locked_by" not in Job.model_fields
+    assert "locked_by" in ClaimedJob.model_fields
 
 
 def test_job_event_defaults():
@@ -166,7 +198,7 @@ def test_job_event_dump_is_jsonb_safe():
     dumped = ev.model_dump(mode="json")
 
     assert isinstance(dumped["ts"], str), "ts must serialize to a string for jsonb"
-    assert set(dumped) == {"stage", "status", "detail", "ts"}
+    assert set(dumped) == {"stage", "status", "detail", "ts", "attempt"}
 
 
 def test_job_defaults():
@@ -233,7 +265,7 @@ async def test_job_store_round_trip():
     cid = f"test-{uuid.uuid4().hex[:8]}"
     try:
         try:
-            job = await jobs.create_job(client_id=cid, document_name="passport.pdf")
+            job = await jobs.enqueue(client_id=cid, kind="ingest", document_name="passport.pdf")
         except asyncpg.UndefinedTableError:
             pytest.skip("migration 005 (di_job) not applied yet")
 
@@ -258,8 +290,10 @@ async def test_job_store_round_trip():
 
         # idempotency: same key collapses onto one job
         key = f"idem-{uuid.uuid4().hex[:8]}"
-        first = await jobs.create_job(client_id=cid, document_name="a.pdf", idempotency_key=key)
-        second = await jobs.create_job(client_id=cid, document_name="a.pdf", idempotency_key=key)
+        first = await jobs.enqueue(client_id=cid, kind="ingest", document_name="a.pdf",
+                                    idempotency_key=key)
+        second = await jobs.enqueue(client_id=cid, kind="ingest", document_name="a.pdf",
+                                     idempotency_key=key)
         assert first.id == second.id
         found = await jobs.find_by_idempotency(cid, key)
         assert found is not None and found.id == first.id

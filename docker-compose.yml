@@ -1,8 +1,10 @@
-# Local stack: Postgres-with-pgvector + the Document Intelligence app + a mock Azure OCR.
+# Local stack: Postgres-with-pgvector + the Document Intelligence app + a durable-queue worker +
+# a mock Azure OCR.
 #
 #   docker compose up --build                 # default: raw bytes stored in Postgres (bytea)
 #   BLOB_BACKEND=local docker compose up      # raw bytes on a docker volume
 #   docker compose --profile s3 up --build    # raw bytes in MinIO (S3-compatible)
+#   docker compose up --build --scale worker=3   # demonstrate horizontal claim distribution
 #
 # The app applies migrations on startup (under a dedicated di_owner connection, advisory-locked)
 # and, because this DB ships pgvector, creates the vector extension, embedding columns and HNSW
@@ -10,10 +12,91 @@
 # docker/initdb/01_roles.sql (created automatically on first init of an empty data directory) and
 # docs/specs/2026-07-15-enterprise-scale-plan.md §3 "RLS production posture".
 #
+# Ingest work runs on the DEDICATED `worker` service, not embedded in `app`
+# (INGEST_EMBEDDED_WORKER=false below) — this compose stack exercises the real production
+# topology, not a demo shortcut, per the plan's interaction 17. The worker connects as
+# di_worker_login (member of both di_app_rw and di_worker — see docker/initdb/01_roles.sql), which
+# is what makes di_job's cross-tenant claim query work without any GUC-trust mechanism.
+#
 # NOTE: if you have an existing `pgdata` volume from before this role split, the initdb script
 # will NOT run against it (postgres only runs docker-entrypoint-initdb.d on an EMPTY data
 # directory). Run `docker compose down -v` once to re-provision, or run
 # `tools/bootstrap_roles.sql` against the existing database as the `di` superuser.
+
+x-di-env: &di-env
+  DI_ENV: local
+  PG_HOST: db
+  PG_PORT: "5432"
+  # Migrations (DDL) run on a dedicated connection as the schema owner, never on the runtime
+  # pool. MIGRATIONS_MODE=auto means the app process runs them itself at boot (fine for a
+  # single-node demo); production sets MIGRATIONS_MODE=verify and runs `python -m di.migrate`
+  # as a separate step so app/worker instances never hold DDL-capable credentials at all.
+  PG_MIGRATION_USER: di_owner
+  PG_MIGRATION_PASSWORD: di_owner
+  MIGRATIONS_MODE: auto
+  PG_DATABASE: document_intelligence
+  PG_SCHEMA: di
+  PG_HASH_PARTITIONS: "8"
+  RLS_ENABLED: "true"
+
+  # --- Auth: on by default. This bootstrap key is seeded at startup and is what the console
+  # --- and the smoke test use. Rotate/replace it for anything beyond a local demo.
+  AUTH_ENABLED: "true"
+  DI_BOOTSTRAP_API_KEY: "di_local_dev_key_change_me"
+  KEY_ROTATION_OVERLAP_HOURS: "24"
+
+  # --- Rate limiting (per-process backstop) ---
+  RATE_LIMIT_ENABLED: "true"
+  RATE_LIMIT_DEFAULT_RPS: "50"
+  RATE_LIMIT_BURST: "100"
+  AUTH_FAILURE_CACHE_SECONDS: "5"
+
+  # --- Per-tenant ingest quotas ---
+  INGEST_MAX_ACTIVE_JOBS_PER_CLIENT: "25"
+  INGEST_DAILY_LIMIT_PER_CLIENT: "0"
+
+  # --- Read-side access audit. Strict stays off for the demo so a slow/absent writer never
+  # --- turns a local run into an outage; production sets this true (enforced by di/posture.py).
+  ACCESS_AUDIT_ENABLED: "true"
+  ACCESS_AUDIT_STRICT: "false"
+  ACCESS_AUDIT_RETENTION_DAYS: "400"
+
+  # --- Blob storage: where the raw uploaded bytes live.
+  # postgres (default) | local (docker volume at /data/blobs) | s3 (MinIO below) | none
+  BLOB_BACKEND: ${BLOB_BACKEND:-postgres}
+  BLOB_LOCAL_DIR: /data/blobs
+  S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+  S3_BUCKET: ${S3_BUCKET:-document-intelligence}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+  S3_REGION: us-east-1
+
+  DI_RETRIEVAL_STUB: "true"     # offline model gateway; set false + RETRIEVAL_BASE_URL for real
+  RETRIEVAL_BASE_URL: ""        # e.g. http://host.docker.internal:8000 once its gateway is up
+  RETRIEVAL_API_KEY: ""
+
+  # Azure OCR (Computer Vision Read v3.2). Defaults to the local mock so the Azure code path is
+  # exercised offline; override with your real resource:
+  #   AZURE_VISION_ENDPOINT=https://<res>.cognitiveservices.azure.com/ AZURE_VISION_KEY=<key>
+  AZURE_VISION_ENDPOINT: ${AZURE_VISION_ENDPOINT:-http://azure-ocr-mock:5000}
+  AZURE_VISION_KEY: ${AZURE_VISION_KEY:-mock-key}
+
+  EMBEDDING_DIM_DEFAULT: "768"
+  AREP_ASYNC: "true"            # accessibility reps run as a deferred 'arep' job on the worker
+  MASK_BY_DEFAULT: "true"       # fail-closed: sensitive values redacted unless asked for
+  DI_LOG_LEVEL: INFO
+
+  # --- Durable job queue / workers ---
+  INGEST_EMBEDDED_WORKER: "false"   # ingest runs on the dedicated `worker` service, not here
+  JOB_LEASE_SECONDS: "300"
+  JOB_MAX_ATTEMPTS: "3"
+  JOB_POLL_INTERVAL_SECONDS: "2"
+  JOB_CLAIM_BATCH: "4"
+  JOB_REAPER_INTERVAL_SECONDS: "30"
+  INGEST_TENANT_MAX_RUNNING: "4"
+  INGEST_TENANT_MAX_QUEUED: "50000"
+  BLOB_RETAIN_AFTER_INGEST: "true"
+
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -37,70 +120,12 @@ services:
   app:
     build: .
     environment:
-      DI_ENV: local
-      PG_HOST: db
-      PG_PORT: "5432"
-      # Runtime pool connects as the least-privilege role — see docker/initdb/01_roles.sql.
+      <<: *di-env
+      # Runtime pool connects as the least-privilege role — see docker/initdb/01_roles.sql. The
+      # API never holds di_worker membership, so it cannot claim di_job cross-tenant even if
+      # INGEST_EMBEDDED_WORKER were mistakenly flipped on.
       PG_USER: di_app
       PG_PASSWORD: di_app
-      # Migrations (DDL) run on a dedicated connection as the schema owner, never on the runtime
-      # pool. MIGRATIONS_MODE=auto means this app process runs them itself at boot (fine for a
-      # single-node demo); production sets MIGRATIONS_MODE=verify and runs `python -m di.migrate`
-      # as a separate step so app instances never hold DDL-capable credentials at all.
-      PG_MIGRATION_USER: di_owner
-      PG_MIGRATION_PASSWORD: di_owner
-      MIGRATIONS_MODE: auto
-      PG_DATABASE: document_intelligence
-      PG_SCHEMA: di
-      PG_HASH_PARTITIONS: "8"
-      RLS_ENABLED: "true"
-
-      # --- Auth: on by default. This bootstrap key is seeded at startup and is what the console
-      # --- and the smoke test use. Rotate/replace it for anything beyond a local demo.
-      AUTH_ENABLED: "true"
-      DI_BOOTSTRAP_API_KEY: "di_local_dev_key_change_me"
-      KEY_ROTATION_OVERLAP_HOURS: "24"
-
-      # --- Rate limiting (per-process backstop) ---
-      RATE_LIMIT_ENABLED: "true"
-      RATE_LIMIT_DEFAULT_RPS: "50"
-      RATE_LIMIT_BURST: "100"
-      AUTH_FAILURE_CACHE_SECONDS: "5"
-
-      # --- Per-tenant ingest quotas ---
-      INGEST_MAX_ACTIVE_JOBS_PER_CLIENT: "25"
-      INGEST_DAILY_LIMIT_PER_CLIENT: "0"
-
-      # --- Read-side access audit. Strict stays off for the demo so a slow/absent writer never
-      # --- turns a local run into an outage; production sets this true (enforced by di/posture.py).
-      ACCESS_AUDIT_ENABLED: "true"
-      ACCESS_AUDIT_STRICT: "false"
-      ACCESS_AUDIT_RETENTION_DAYS: "400"
-
-      # --- Blob storage: where the raw uploaded bytes live.
-      # postgres (default) | local (docker volume at /data/blobs) | s3 (MinIO below) | none
-      BLOB_BACKEND: ${BLOB_BACKEND:-postgres}
-      BLOB_LOCAL_DIR: /data/blobs
-      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
-      S3_BUCKET: ${S3_BUCKET:-document-intelligence}
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
-      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
-      S3_REGION: us-east-1
-
-      DI_RETRIEVAL_STUB: "true"     # offline model gateway; set false + RETRIEVAL_BASE_URL for real
-      RETRIEVAL_BASE_URL: ""        # e.g. http://host.docker.internal:8000 once its gateway is up
-      RETRIEVAL_API_KEY: ""
-
-      # Azure OCR (Computer Vision Read v3.2). Defaults to the local mock so the Azure code path is
-      # exercised offline; override with your real resource:
-      #   AZURE_VISION_ENDPOINT=https://<res>.cognitiveservices.azure.com/ AZURE_VISION_KEY=<key>
-      AZURE_VISION_ENDPOINT: ${AZURE_VISION_ENDPOINT:-http://azure-ocr-mock:5000}
-      AZURE_VISION_KEY: ${AZURE_VISION_KEY:-mock-key}
-
-      EMBEDDING_DIM_DEFAULT: "768"
-      AREP_ASYNC: "false"           # generate accessibility reps synchronously for the demo
-      MASK_BY_DEFAULT: "true"       # fail-closed: sensitive values redacted unless asked for
-      DI_LOG_LEVEL: INFO
     ports:
       # Console + API. Override DI_APP_PORT in .env if 8080 is taken on your machine.
       - "${DI_APP_PORT:-8080}:8080"
@@ -111,6 +136,33 @@ services:
         condition: service_healthy
       azure-ocr-mock:
         condition: service_healthy
+
+  # Dedicated ingest worker (di/worker.py) — claims di_job rows, runs the pipeline, heartbeats a
+  # lease, and every instance runs the reaper. `--scale worker=3` demonstrates horizontal claim
+  # distribution locally: SKIP LOCKED means concurrent workers never double-claim a row.
+  worker:
+    build: .
+    command: ["python", "-m", "di.worker"]
+    environment:
+      <<: *di-env
+      # di_worker_login is a member of BOTH di_app_rw (tenant-scoped pipeline writes, same grants
+      # di_app has) AND di_worker (di_job's role-targeted worker_claim policy — cross-tenant
+      # claim/heartbeat/reap visibility with no GUC-trust mechanism). See
+      # docker/initdb/01_roles.sql and di/db.py::acquire_queue.
+      PG_USER: di_worker_login
+      PG_PASSWORD: di_worker
+    volumes:
+      - blobdata:/data/blobs        # used when BLOB_BACKEND=local
+    depends_on:
+      db:
+        condition: service_healthy
+      azure-ocr-mock:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9090/health')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   # Mock Azure OCR (Computer Vision Read v3.2) — plain Python + Tesseract, no Azure SDK.
   # Lets the app's Azure v3.2 HTTP client run end-to-end locally without a real Azure resource.

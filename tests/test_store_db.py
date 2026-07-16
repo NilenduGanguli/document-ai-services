@@ -42,16 +42,16 @@ async def test_store_round_trip():
             sensitivity_bucket=SensitivityBucket.critical, page_count=1,
         )
         doc_id = await store.insert_document(meta, ocr_text="PASSPORT Jane Doe nationality EXAMPLE")
-        ver = await store.create_version(
-            cid, doc_id, content_hash="h1", version_no=1, supersedes_id=None)
+        ver = await store.create_version(cid, doc_id, content_hash="h1")
+        version_id = ver.version_id
 
-        root = KNode(id=str(uuid.uuid4()), client_id=cid, doc_id=doc_id, version_id=ver,
+        root = KNode(id=str(uuid.uuid4()), client_id=cid, doc_id=doc_id, version_id=version_id,
                      path=base, node_type=NodeType.document, depth=3, title="PASSPORT")
-        chunk = KNode(id=str(uuid.uuid4()), client_id=cid, doc_id=doc_id, version_id=ver,
+        chunk = KNode(id=str(uuid.uuid4()), client_id=cid, doc_id=doc_id, version_id=version_id,
                       parent_id=root.id, path=f"{base}.s0.c0", node_type=NodeType.chunk, depth=5,
                       content="Jane Doe, nationality EXAMPLE, passport number X1234567",
                       provenance=Provenance(page=1))
-        fact = KNode(id=str(uuid.uuid4()), client_id=cid, doc_id=doc_id, version_id=ver,
+        fact = KNode(id=str(uuid.uuid4()), client_id=cid, doc_id=doc_id, version_id=version_id,
                      parent_id=root.id, path=f"{base}.f0", node_type=NodeType.fact, depth=4,
                      attribute_key="id.passport_number", value_text="X1234567",
                      verification_status=VerificationStatus.checksum_verified, confidence=0.95,

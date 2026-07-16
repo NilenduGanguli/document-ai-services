@@ -1,14 +1,17 @@
 """Ingest router.
 
 ``POST /api/v1/ingest`` accepts a document and returns **202 + job_id** (the durable default):
-the pipeline runs in the background and the caller polls ``GET /api/v1/jobs/{id}``, so a dropped
-connection, an LB timeout or a pod restart no longer loses the work. ``?stream=true`` keeps the
-original SSE behaviour for interactive callers who want live stages on one connection.
+the raw bytes are persisted to the blob store BEFORE the 202 is returned (blob-at-accept — a
+crash or pod restart between accept and worker-claim can no longer lose the payload the bank just
+acknowledged accepting), then a durable ``di_job`` row is enqueued for a worker to claim.
+``?stream=true`` keeps the original SSE behaviour for interactive callers who want live stages on
+one connection; bytes there stay in request memory as before, no contract change.
 
 Admission order (the one place fairness/backpressure is enforced): ``authorize_client`` ->
 idempotency pre-check (a retried already-accepted submit must never 429) -> unified per-tenant
-quota. ``stream=true`` shares the quota via an in-process inflight-stream counter folded into the
-active count, so a leaked ingest-scoped key cannot bypass the quota by using the streaming path.
+quota -> blob-put -> enqueue. ``stream=true`` shares the quota via an in-process inflight-stream
+counter folded into the active count, so a leaked ingest-scoped key cannot bypass the quota by
+using the streaming path.
 """
 from __future__ import annotations
 
@@ -22,8 +25,9 @@ from sse_starlette.sse import EventSourceResponse
 from di import jobs
 from di.auth import Principal, authorize_client, require_scope
 from di.config import get_settings
-from di.ingest_runner import submit_ingest_job
 from di.pipeline import ingest_document
+from di.storage import BlobStoreError, blob_key, get_blob_store
+from di.subtree import versioning
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["ingest"])
@@ -114,6 +118,24 @@ async def _tenant_policy(client_id: str) -> dict | None:
         return None
 
 
+def _require_durable_blob_backend() -> None:
+    """Async ingest requires durable payload storage: blob_backend=none discards bytes and
+    returns a ref with an empty uri, which would otherwise 202 successfully and then dead-letter
+    the job the instant a worker claims it (BlobNotFound) — a fake-success 202 followed by silent
+    failure. Reject explicitly at the door instead; ?stream=true (bytes stay in request memory)
+    remains available for a none-backend deployment.
+
+    Raises:
+        HTTPException: 503, when ``settings.blob_backend == "none"``.
+    """
+    if get_settings().blob_backend == "none":
+        raise HTTPException(
+            status_code=503,
+            detail="async (202) ingest requires durable blob storage (BLOB_BACKEND=none does "
+                   "not retain bytes); use ?stream=true or configure postgres/local/s3",
+        )
+
+
 @router.post("/ingest", response_model=IngestAccepted, status_code=202)
 async def ingest(
     request: Request,
@@ -163,12 +185,32 @@ async def ingest(
                                   document_name=existing.document_name, reused=True)
 
     await _enforce_ingest_quota(client_id)
+    _require_durable_blob_backend()
 
-    job = await jobs.create_job(client_id=client_id, document_name=filename,
-                                idempotency_key=idempotency_key)
-    await submit_ingest_job(
-        job_id=job.id, client_id=client_id, file_bytes=content, filename=filename, mime=mime,
-        external_document_id=external_document_id, created_by=principal.name,
+    # Blob-first: the 202 is only returned once the raw bytes are durable. Content-addressed keys
+    # make a retry (same idempotency_key, or none at all) an idempotent overwrite, so a crash
+    # between this put and the job insert below just orphans a harmless, later-reusable blob —
+    # never a fatal one. Failure here is fatal to the REQUEST (503, no job row): a 202 must never
+    # be issued for bytes that cannot durably be produced later.
+    content_hash = versioning.content_hash(content)
+    try:
+        ref = await get_blob_store().put(
+            client_id=client_id, key=blob_key(client_id, content_hash, filename),
+            data=content, content_type=mime,
+        )
+    except BlobStoreError as exc:
+        logger.exception("blob-at-accept failed for client=%s file=%s", client_id, filename)
+        raise HTTPException(status_code=503, detail=f"could not durably store the upload: {exc}") \
+            from exc
+
+    job = await jobs.enqueue(
+        client_id=client_id, kind="ingest", document_name=filename,
+        idempotency_key=idempotency_key,
+        payload={
+            "blob_uri": ref.uri, "blob_backend": ref.backend, "content_hash": content_hash,
+            "filename": filename, "mime": mime, "external_document_id": external_document_id,
+            "created_by": principal.name, "size": len(content),
+        },
     )
     return IngestAccepted(job_id=job.id, client_id=client_id, status=job.status.value,
                           document_name=filename)

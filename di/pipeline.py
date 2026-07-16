@@ -14,7 +14,7 @@ from typing import Any
 import anyio
 
 import di.extract.deterministic  # noqa: F401 - import side-effect registers extractors
-from di import observability, ontology, serving, store
+from di import jobs, observability, ontology, serving, store
 from di.config import get_settings
 from di.db import pgvector_available
 from di.extract import base as extract_base
@@ -34,7 +34,7 @@ from di.models import (
 )
 from di.ocr import vision
 from di.retrieval_client import get_retrieval_client
-from di.storage import BlobStoreError, blob_key, get_blob_store
+from di.storage import BlobRef, BlobStoreError, blob_key, get_blob_store
 from di.subtree import arep as arep_mod
 from di.subtree import build, context, merge, versioning
 
@@ -160,11 +160,20 @@ async def ingest_document(
     mime: str | None = None,
     created_by: str | None = None,
     external_document_id: str | None = None,
+    blob: BlobRef | None = None,
+    content_hash: str | None = None,
 ) -> AsyncIterator[IngestEvent]:
     """Async generator yielding pipeline stage events; persists the knowledge subtree.
 
+    Args:
+        blob: When the caller already persisted the raw bytes (the queue's blob-at-accept path),
+            pass the resulting ref here to skip ``_retain_blob``/hash-recompute. The ``stream=true``
+            inline path passes neither this nor ``content_hash`` and behaves exactly as before —
+            no contract change for that path.
+        content_hash: Pre-computed SHA-256 of ``file_bytes``, when the caller already has it.
+
     Emits a terminal ``error`` event on failure so a consumer can distinguish a real completion
-    from a dropped stream, then re-raises for the caller (the job runner) to record.
+    from a dropped stream, then re-raises for the caller (the worker) to record.
     """
     settings = get_settings()
     client = get_retrieval_client(settings)
@@ -172,16 +181,19 @@ async def ingest_document(
     try:
         # Hash FIRST: an unchanged re-upload must no-op without paying for OCR (which can be a
         # ~60s Azure Read round-trip per page).
-        content_hash = versioning.content_hash(file_bytes)
+        content_hash = content_hash or versioning.content_hash(file_bytes)
         existing = await store.find_document(client_id, filename, external_document_id)
         doc_id = str(existing["id"]) if existing else None
         current = await store.get_current_version(client_id, doc_id) if doc_id else None
-        plan = versioning.decide_version(
-            content_hash,
-            current["version_no"] if current else None,
-            current["content_hash"] if current else None,
-        )
-        if plan.is_noop:
+
+        # Cheap, UNLOCKED pre-check: purely a latency optimization to skip OCR for the common
+        # identical-resubmission case. NOT the authoritative decision — store.create_version()
+        # (called below, after OCR/gate/extract) re-derives this under a per-document advisory
+        # lock and is the single source of truth for version identity. A stale read here just
+        # means OCR occasionally runs unnecessarily before the authoritative check also says
+        # noop; it can never cause the wrong version_no to be assigned.
+        if (current is not None and current["content_hash"] == content_hash
+                and current["ingest_complete"]):
             observability.observe_ingest("noop")
             yield IngestEvent(stage="version", status="skip",
                               detail={"reason": "identical content already current", "doc_id": doc_id})
@@ -198,8 +210,13 @@ async def ingest_document(
         observability.observe_ocr(ocr.engine)
         yield IngestEvent(stage="ocr", detail={"engine": ocr.engine, "pages": ocr.pages})
 
-        blob_uri, blob_backend = await _retain_blob(
-            client_id, file_bytes, content_hash, filename, mime)
+        blob_uri: str | None
+        blob_backend: str | None
+        if blob is not None:
+            blob_uri, blob_backend = blob.uri, blob.backend
+        else:
+            blob_uri, blob_backend = await _retain_blob(
+                client_id, file_bytes, content_hash, filename, mime)
 
         yield IngestEvent(stage="gate", status="start")
         with observability.stage_timer("gate"):
@@ -243,14 +260,32 @@ async def ingest_document(
             meta, ocr_text=ocr.text, ocr_lines=[ln.model_dump(mode="json") for ln in ocr.lines],
             lang_profile=gate.lang_profile.model_dump(mode="json"))
         await store.record_decision_trace(client_id, doc_id, gate)
-        version_id = await store.create_version(
-            client_id, doc_id, content_hash=content_hash, version_no=plan.version_no,
-            supersedes_id=str(current["id"]) if current else None, created_by=created_by)
 
-        # --- Build subtree ---
-        base = _base_path(client_id, gate.classification.doc_type, plan.version_no)
+        # --- Authoritative version decision (locked; see store.create_version) ---
+        version = await store.create_version(
+            client_id, doc_id, content_hash=content_hash, created_by=created_by)
+        if version.is_noop:
+            observability.observe_ingest("noop")
+            yield IngestEvent(stage="version", status="skip",
+                              detail={"reason": "identical content already current "
+                                                "(authoritative)", "doc_id": doc_id})
+            yield IngestEvent(stage="done", detail={"doc_id": doc_id, "noop": True})
+            return
+        if version.resume:
+            # At-least-once retry of an interrupted attempt: same version_id/version_no, but its
+            # subtree never finished — clear whatever a crashed worker partially wrote before
+            # rebuilding, so knode/arep inserts (fresh UUIDs, not idempotent on their own) don't
+            # duplicate rows on top of the prior partial attempt.
+            await store.delete_version_artifacts(client_id, version.version_id)
+            yield IngestEvent(stage="version", status="resume",
+                              detail={"doc_id": doc_id, "version_id": version.version_id,
+                                      "version_no": version.version_no})
+
+        # --- Build subtree, using the AUTHORITATIVE version decided above (never the stale
+        # --- pre-lock read) ---
+        base = _base_path(client_id, gate.classification.doc_type, version.version_no)
         nodes = build.build_subtree(
-            client_id=client_id, doc_id=doc_id, version_id=version_id,
+            client_id=client_id, doc_id=doc_id, version_id=version.version_id,
             classification=gate.classification, ocr=ocr, facts=facts, base_path=base,
             doc_sensitivity=doc_sensitivity)
 
@@ -268,6 +303,7 @@ async def ingest_document(
 
         # --- Accessibility representations (LLM-generated; SEND_TO_LLM only) ---
         rep_count = 0
+        deferred = False
         if allow_llm and not settings.arep_async:
             try:
                 reps = await arep_mod.generate_areps(
@@ -279,16 +315,33 @@ async def ingest_document(
                 rep_count = len(reps)
             except Exception:  # noqa: BLE001
                 logger.exception("accessibility-rep generation failed")
-        yield IngestEvent(stage="arep", detail={"reps": rep_count,
-                                                "deferred": settings.arep_async and allow_llm})
+        elif allow_llm and settings.arep_async:
+            # Previously dropped entirely (nothing ever consumed arep_async's deferral). Now a
+            # real job kind, idempotent per version via the idempotency_key: a retried ingest
+            # attempt enqueuing the same version's arep work returns the existing job instead of
+            # duplicating it. The content-bearing nodes ride in the payload rather than being
+            # re-fetched/reconstructed from di_job's dicts on the worker side — this is the one
+            # place in the pipeline that already holds them as typed KNode objects.
+            content_nodes = [n for n in nodes if n.node_type in _CONTENT_TYPES]
+            await jobs.enqueue(
+                client_id=client_id, kind="arep",
+                payload={"doc_id": doc_id, "version_id": version.version_id,
+                         "nodes": [n.model_dump(mode="json") for n in content_nodes]},
+                idempotency_key=f"arep:{version.version_id}")
+            deferred = True
+        yield IngestEvent(stage="arep", detail={"reps": rep_count, "deferred": deferred})
 
         # --- Cross-document merge into the client-level view ---
         merged = await _remerge_client_facts(client_id)
         yield IngestEvent(stage="merge", detail={"merged_facts": merged})
 
+        # Flip ingest_complete LAST, after every other write for this version has landed — this
+        # is what makes the noop-on-retry check correct (di/subtree/versioning.py).
+        await store.mark_version_complete(client_id, version.version_id)
+
         observability.observe_ingest("succeeded")
         yield IngestEvent(stage="done", detail={
-            "doc_id": doc_id, "version_id": version_id, "version_no": plan.version_no,
+            "doc_id": doc_id, "version_id": version.version_id, "version_no": version.version_no,
             "doc_type": gate.classification.doc_type, "decision": gate.decision.value,
             "nodes": len(nodes), "facts": len(facts), "blob_backend": blob_backend})
     except Exception as exc:

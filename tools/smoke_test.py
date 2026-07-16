@@ -120,7 +120,7 @@ def main() -> int:
           f"degraded={ready.get('degraded')}")
     comps = ready.get("components", {})
     for name in ("db", "migrations", "posture", "rls", "pgvector", "retrieval", "blob", "ocr",
-                 "auth", "audit"):
+                 "auth", "audit", "queue"):
         c = comps.get(name, {})
         check(f"  component {name}", bool(c.get("ok")),
               f"{c.get('detail','')} {c.get('extra','')}".strip())
@@ -129,6 +129,8 @@ def main() -> int:
     r = client.get(f"{BASE}/metrics", timeout=5)
     check("/metrics exposes prometheus text", r.status_code == 200 and "di_" in r.text,
           f"{len(r.text)} bytes")
+    check("  /metrics exposes queue depth gauge", "di_queue_depth" in r.text)
+    check("  /metrics exposes jobs-inflight gauge", "di_jobs_inflight" in r.text)
 
     # ---------------------------------------------------------------- auth
     print("\nauth")
@@ -277,6 +279,29 @@ def main() -> int:
     jl = r.json()
     check("GET /jobs paginates", r.status_code == 200 and len(jl.get("jobs", [])) == 1,
           f"next_cursor={'set' if jl.get('next_cursor') else 'none'}")
+
+    # ---------------------------------------------------------------- queue mechanics (Phase 4)
+    # Full dead-letter->retry and lease-expiry->reclaim round trips need control over the worker
+    # process (killing it mid-job, or waiting out a multi-minute lease) that a pure-HTTP smoke
+    # test against a live stack cannot orchestrate; those paths are covered by
+    # tests/test_queue_db.py (direct DB) and were live-verified manually against the real worker
+    # container during Phase 4 development. This section checks what IS reachable over HTTP: the
+    # job carries the queue-native fields, and retry/cancel correctly refuse a job in the wrong
+    # state rather than silently no-opping.
+    print("\nqueue mechanics")
+    check("job carries kind=ingest", job.get("kind") == "ingest", f"kind={job.get('kind')}")
+    check("job carries attempts/max_attempts", job.get("max_attempts", 0) >= 1,
+          f"attempts={job.get('attempts')} max_attempts={job.get('max_attempts')}")
+
+    # retry only applies to a dead job — this one already succeeded.
+    r = client.post(f"{BASE}/api/v1/jobs/{job_id}/retry", params={"client_id": CLIENT},
+                    headers=hdr(), timeout=10)
+    check("  retry on a non-dead job -> 404", r.status_code == 404, f"got {r.status_code}")
+
+    # cancel only applies to a still-queued job — this one already succeeded.
+    r = client.post(f"{BASE}/api/v1/jobs/{job_id}/cancel", params={"client_id": CLIENT},
+                    headers=hdr(), timeout=10)
+    check("  cancel on a non-queued job -> 404", r.status_code == 404, f"got {r.status_code}")
 
     # ---------------------------------------------------------------- auth hardening (Phase 2)
     print("\nauth hardening")

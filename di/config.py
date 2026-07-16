@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
@@ -84,6 +84,13 @@ class Settings(BaseSettings):
     # distinct role so the runtime pool never holds DDL-capable credentials — see MIGRATIONS_MODE.
     pg_migration_user: str = ""
     pg_migration_password: str = ""
+    # Worker-role credentials (di_worker_login) for the queue's cross-tenant claim/heartbeat/reap
+    # operations — see di.db.acquire_queue(). Empty falls back to pg_user, so a bare single-role
+    # local/test setup keeps working. A dedicated `python -m di.worker` process typically sets
+    # PG_USER to di_worker_login directly and can leave these unset; the embedded (compose/demo)
+    # worker needs them set distinctly, since the API's own pool must stay on di_app.
+    pg_worker_user: str = ""
+    pg_worker_password: str = ""
     # auto = apply migrations in-process as the migration role (compose/demo default); verify =
     # never apply, only assert the ledger matches what's on disk and refuse to boot on drift (the
     # migration step runs separately via `python -m di.migrate`); off = skip entirely (advanced).
@@ -141,7 +148,38 @@ class Settings(BaseSettings):
     # Server-side default for the serving masking projection. Fail-closed: sensitive values are
     # redacted unless the caller explicitly (and with clearance) asks for them.
     mask_by_default: bool = True
-    ingest_concurrency: int = 4              # max ingest jobs processed at once per instance
+    ingest_concurrency: int = 4              # max ingest jobs processed at once per worker process
+
+    # --- Durable job queue / workers ---
+    # Defaults to `not is_production` via the validator below when left unset (env, init kwarg,
+    # and .env all count as "set") — a forgotten env var in prod must never silently recreate the
+    # old in-process coupling of ingest work to API replicas.
+    ingest_embedded_worker: bool = True
+    job_lease_seconds: int = 300             # > worst-case OCR stage; heartbeat renews at lease/4
+    job_max_attempts: int = 3
+    job_retry_base_seconds: float = 30.0
+    job_retry_max_seconds: float = 3600.0
+    job_poll_interval_seconds: float = 2.0   # LISTEN fallback when a NOTIFY is missed
+    job_claim_batch: int = 4
+    job_reaper_interval_seconds: float = 30.0
+    job_drain_timeout_seconds: float = 30.0
+    worker_metrics_port: int = 9090
+    # Fleet-wide per-tenant concurrency cap (soft — see di.jobs.claim). The global queued cap from
+    # the original design is dropped: the accept path runs under the tenant GUC (FORCE RLS), so a
+    # cross-tenant count would need a SECURITY DEFINER function or a dedicated role for no real
+    # gain — per-tenant caps plus the per-key rate limiter plus worker-side depth alerts cover it.
+    ingest_tenant_max_running: int = 4
+    ingest_tenant_max_queued: int = 50_000   # accept-side backpressure -> 429
+    blob_retain_after_ingest: bool = True
+    # Dead-job payload blobs (content-addressed uploads for jobs that never succeeded) are swept
+    # by di.tools.blob_gc after this many days — see di.jobs.enqueue(kind="blob_gc").
+    dead_blob_retention_days: int = 30
+
+    @model_validator(mode="after")
+    def _embedded_worker_default_off_in_prod(self) -> Settings:
+        if "ingest_embedded_worker" not in self.model_fields_set and self.is_production:
+            self.ingest_embedded_worker = False
+        return self
 
     # --- Request limits (unbounded requests/responses are a DoS + gateway-timeout risk) ---
     max_upload_mb: int = 25

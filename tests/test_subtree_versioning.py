@@ -42,6 +42,35 @@ def test_decide_version_noop_when_current_no_is_zero() -> None:
     assert plan == VersionPlan(is_noop=True, version_no=0, supersedes_no=None)
 
 
+def test_decide_version_resume_on_incomplete_hash_match() -> None:
+    """The at-least-once noop-on-retry fix: a hash match against an INCOMPLETE version is never
+    a noop — it must resume the SAME version_no, not mint a new one and not skip work."""
+    plan = decide_version(new_hash="abc", current_no=3, current_hash="abc",
+                          current_complete=False)
+    assert plan.is_noop is False
+    assert plan.resume is True
+    assert plan.version_no == 3
+    assert plan.supersedes_no is None
+
+
+def test_decide_version_default_complete_is_true() -> None:
+    """current_complete defaults to True so pre-ingest_complete callers are unaffected."""
+    plan = decide_version(new_hash="abc", current_no=3, current_hash="abc")
+    assert plan.resume is False
+    assert plan.is_noop is True
+
+
+def test_decide_version_new_content_ignores_completeness() -> None:
+    """A genuinely new version is unaffected by current_complete either way — resume only
+    applies when the hash actually matches."""
+    plan = decide_version(new_hash="def", current_no=3, current_hash="abc",
+                          current_complete=False)
+    assert plan.is_noop is False
+    assert plan.resume is False
+    assert plan.version_no == 4
+    assert plan.supersedes_no == 3
+
+
 def test_diff_nodes_added_removed_modified() -> None:
     old = [
         ("root.a", "h1"),

@@ -58,6 +58,8 @@ KNOWN_COMPONENTS: tuple[str, ...] = (
     "ocr",
     "blob",
     "auth",
+    "audit",
+    "queue",
 )
 
 
@@ -167,6 +169,13 @@ class _Metrics:
     ocr_engine: Any
     search_seconds: Any
     jobs_inflight: Any
+    queue_depth: Any
+    queue_oldest_age: Any
+    jobs_claimed: Any
+    jobs_retried: Any
+    jobs_dead: Any
+    job_duration: Any
+    worker_leases_lost: Any
 
 
 def _find_collector(name: str) -> Any | None:
@@ -251,6 +260,48 @@ def _build_metrics() -> _Metrics | None:
                 _prom.Gauge,
                 "di_jobs_inflight",
                 "Ingest jobs currently in flight.",
+            ),
+            queue_depth=_get_or_create(
+                _prom.Gauge,
+                "di_queue_depth",
+                "di_job rows by kind and status (refreshed from queue_stats()).",
+                labelnames=("kind", "status"),
+            ),
+            queue_oldest_age=_get_or_create(
+                _prom.Gauge,
+                "di_queue_oldest_age_seconds",
+                "Age of the oldest queued job, by kind.",
+                labelnames=("kind",),
+            ),
+            jobs_claimed=_get_or_create(
+                _prom.Counter,
+                "di_jobs_claimed_total",
+                "Jobs claimed by a worker, by kind.",
+                labelnames=("kind",),
+            ),
+            jobs_retried=_get_or_create(
+                _prom.Counter,
+                "di_jobs_retried_total",
+                "Jobs requeued after a retryable failure or lease expiry, by kind.",
+                labelnames=("kind",),
+            ),
+            jobs_dead=_get_or_create(
+                _prom.Counter,
+                "di_jobs_dead_total",
+                "Jobs dead-lettered (attempts exhausted) — page-worthy at any nonzero rate.",
+                labelnames=("kind",),
+            ),
+            job_duration=_get_or_create(
+                _prom.Histogram,
+                "di_job_duration_seconds",
+                "Wall-clock time from first claim to terminal status, by kind.",
+                labelnames=("kind",),
+                buckets=_STAGE_BUCKETS,
+            ),
+            worker_leases_lost=_get_or_create(
+                _prom.Counter,
+                "di_worker_leases_lost_total",
+                "Times a worker's heartbeat found its own job already reclaimed elsewhere.",
             ),
         )
     except Exception:  # noqa: BLE001 - metrics are never worth failing boot over
@@ -370,6 +421,61 @@ def set_jobs_inflight(n: int) -> None:
     if metrics is None:
         return
     metrics.jobs_inflight.set(n)
+
+
+def set_queue_stats(stats: list[dict[str, Any]]) -> None:
+    """Refresh the queue depth/age gauges from :func:`di.jobs.queue_stats`'s rows.
+
+    Called by every worker's reaper cycle (and by the API process too, so the depth metric does
+    not go stale exactly when every worker is down — the incident it exists to catch).
+    """
+    metrics = _METRICS
+    if metrics is None:
+        return
+    oldest_by_kind: dict[str, float] = {}
+    for row in stats:
+        kind, status = str(row["kind"]), str(row["status"])
+        metrics.queue_depth.labels(kind=kind, status=status).set(row["n"])
+        if status == "queued":
+            age = row.get("oldest_age_seconds") or 0.0
+            oldest_by_kind[kind] = max(oldest_by_kind.get(kind, 0.0), float(age))
+    for kind, age in oldest_by_kind.items():
+        metrics.queue_oldest_age.labels(kind=kind).set(age)
+
+
+def observe_job_claimed(kind: str) -> None:
+    metrics = _METRICS
+    if metrics is None:
+        return
+    metrics.jobs_claimed.labels(kind=str(kind)).inc()
+
+
+def observe_job_retried(kind: str, n: int = 1) -> None:
+    metrics = _METRICS
+    if metrics is None or n <= 0:
+        return
+    metrics.jobs_retried.labels(kind=str(kind)).inc(n)
+
+
+def observe_job_dead(kind: str, n: int = 1) -> None:
+    metrics = _METRICS
+    if metrics is None or n <= 0:
+        return
+    metrics.jobs_dead.labels(kind=str(kind)).inc(n)
+
+
+def observe_job_duration(kind: str, seconds: float) -> None:
+    metrics = _METRICS
+    if metrics is None:
+        return
+    metrics.job_duration.labels(kind=str(kind)).observe(seconds)
+
+
+def observe_lease_lost() -> None:
+    metrics = _METRICS
+    if metrics is None:
+        return
+    metrics.worker_leases_lost.inc()
 
 
 @contextmanager

@@ -19,16 +19,25 @@ class VersionPlan:
     """Outcome of comparing a freshly-hashed upload against the current stored version.
 
     Attributes:
-        is_noop: True when the new content hash equals the current hash (nothing to do).
-        version_no: The version number to assign. Unchanged from ``current_no`` on a no-op,
-            otherwise ``(current_no or 0) + 1``.
+        is_noop: True when the new content hash equals the current hash AND the current version's
+            subtree was actually finished (``current_complete``). A hash match against an
+            INCOMPLETE version is never a noop — see ``resume``.
+        version_no: The version number to assign. Unchanged from ``current_no`` on a noop or a
+            resume, otherwise ``(current_no or 0) + 1``.
         supersedes_no: The version number this new version replaces (the prior ``current_no``),
-            or ``None`` when this is the first version / a no-op.
+            or ``None`` when this is the first version, a noop, or a resume.
+        resume: True when the hash matches the current version but that version never finished
+            (a worker crashed after ``create_version`` committed but before knodes/areps/merge
+            did). The SAME ``version_no`` — and, at the call site, the SAME ``version_id`` — must
+            be reused: this is at-least-once retry rebuilding an incomplete attempt, not a new
+            version and not a true noop. Closes the silent-data-loss hole where a naive hash-match
+            noop would report a job 'succeeded' with zero knodes for that version.
     """
 
     is_noop: bool
     version_no: int
     supersedes_no: int | None
+    resume: bool = False
 
 
 def content_hash(data: bytes | str) -> str:
@@ -52,12 +61,18 @@ def decide_version(
     new_hash: str,
     current_no: int | None,
     current_hash: str | None,
+    *,
+    current_complete: bool = True,
 ) -> VersionPlan:
     """Decide what to do with a new upload given the current stored version.
 
     Rules:
-        * If ``new_hash`` matches ``current_hash`` the upload is a no-op; the version number stays
-          at ``current_no`` (or 0 when there is no current version) and nothing is superseded.
+        * If ``new_hash`` matches ``current_hash`` AND ``current_complete`` is true, the upload is
+          a true no-op; the version number stays at ``current_no`` (or 0 when there is no current
+          version) and nothing is superseded.
+        * If ``new_hash`` matches ``current_hash`` but ``current_complete`` is false, this is an
+          at-least-once retry of an interrupted ingest: resume the SAME ``version_no`` rather than
+          minting a new one or reporting a noop.
         * Otherwise this is a new version: ``version_no = (current_no or 0) + 1`` and it supersedes
           the prior ``current_no`` (``None`` for a first version).
 
@@ -65,12 +80,17 @@ def decide_version(
         new_hash: SHA-256 hex of the incoming content.
         current_no: Version number of the currently-stored version, or ``None`` if none exists.
         current_hash: SHA-256 hex of the currently-stored version, or ``None`` if none exists.
+        current_complete: Whether the current version's subtree (knodes/areps/merge) actually
+            finished. Defaults to ``True`` so pre-``ingest_complete`` callers are unaffected.
 
     Returns:
         A :class:`VersionPlan` describing the decision.
     """
     if current_hash is not None and new_hash == current_hash:
-        return VersionPlan(is_noop=True, version_no=current_no or 0, supersedes_no=None)
+        if current_complete:
+            return VersionPlan(is_noop=True, version_no=current_no or 0, supersedes_no=None)
+        return VersionPlan(is_noop=False, version_no=current_no or 0, supersedes_no=None,
+                           resume=True)
     return VersionPlan(
         is_noop=False,
         version_no=(current_no or 0) + 1,

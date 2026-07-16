@@ -83,6 +83,24 @@ def evaluate_static_posture(settings: Settings) -> list[str]:
             "records instead of refusing the read; production must accept 'no audit -> no reads' "
             "explicitly (set ACCESS_AUDIT_STRICT=true)"
         )
+    if settings.ingest_embedded_worker:
+        violations.append(
+            "INGEST_EMBEDDED_WORKER is true — production API replicas would run ingest/OCR work "
+            "in-process, recreating the coupling the durable-queue upgrade exists to remove; "
+            "deploy dedicated `python -m di.worker` processes and set this false"
+        )
+    if settings.blob_backend == "none":
+        violations.append(
+            "BLOB_BACKEND is 'none' — async (202) ingest requires durable blob storage "
+            "(blob-at-accept: the payload must survive between the 202 and the worker claiming "
+            "it); set BLOB_BACKEND to postgres or s3, or restrict ingest to ?stream=true"
+        )
+    elif settings.blob_backend == "local":
+        violations.append(
+            "BLOB_BACKEND is 'local' — a worker on a different node/pod than the accepting API "
+            "replica would get BlobNotFound for every job (node-local disk, no shared RWX "
+            "volume); use postgres or s3 for any multi-node deployment"
+        )
     if not settings.instance_fingerprint_hmac_key:
         violations.append(
             "INSTANCE_FINGERPRINT_HMAC_KEY is unset — multi-valued-fact instance fingerprints "

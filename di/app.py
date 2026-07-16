@@ -8,6 +8,8 @@ probe.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import uuid
 from collections.abc import AsyncIterator
@@ -19,13 +21,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from di import audit, auth, ingest_runner, observability, posture
+from di import audit, auth, jobs, observability, posture
 from di.audit import AccessRecord, AuditUnavailable, resolve_audit_client_id
 from di.config import get_settings
 from di.db import (
     access_log_partition_horizon_months,
     assert_rls_posture,
     close_pool,
+    close_worker_pool,
     init_pool,
     open_migration_connection,
     pgvector_available,
@@ -36,8 +39,16 @@ from di.db import (
 from di.observability import READINESS
 from di.retrieval_client import get_retrieval_client
 from di.storage import get_blob_store
+from di.worker import Consumer
 
 logger = logging.getLogger(__name__)
+
+#: The embedded worker's Consumer, when ingest_embedded_worker=true. None for a pure API process
+#: (production default) or a dedicated `python -m di.worker` deployment.
+_embedded_worker: Consumer | None = None
+#: Background task keeping the queue depth/age gauges warm on a pure API process (no embedded
+#: worker of its own to do it via a reaper cycle). See _refresh_queue_gauges.
+_queue_gauge_task: asyncio.Task | None = None
 
 # Compiled React console: frontend/dist/{index.html, assets/*} — built by `npm run build`.
 _FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
@@ -241,9 +252,65 @@ async def _startup() -> None:
     if settings.access_audit_strict and "audit" not in observability.REQUIRED_COMPONENTS:
         observability.REQUIRED_COMPONENTS = (*observability.REQUIRED_COMPONENTS, "audit")
 
+    # Queue: reported but NOT added to REQUIRED_COMPONENTS. Production is already protected by
+    # the static posture guard (di/posture.py), which crashes the boot outright before this ever
+    # runs if blob_backend=none — so by construction this "not ready" branch only ever fires in a
+    # non-production environment that deliberately chose blob_backend=none (e.g. a stream=true-only
+    # demo). Treating that deliberate choice as "the whole service is not ready" — including its
+    # unrelated read paths — would be disproportionate; the detail string is enough to explain the
+    # degraded ingest capability.
+    if migrations_ok:
+        try:
+            stats = await jobs.queue_stats()
+            observability.set_queue_stats(stats)
+            queue_ok = settings.blob_backend != "none"
+            READINESS.set(
+                "queue", queue_ok,
+                "ready" if queue_ok else
+                "BLOB_BACKEND=none — async ingest is unavailable (use ?stream=true)",
+                depth=sum(int(s["n"]) for s in stats), embedded_worker=settings.ingest_embedded_worker,
+            )
+        except Exception as exc:  # noqa: BLE001
+            READINESS.set("queue", False, f"queue_stats failed: {exc}")
+            logger.exception("could not check queue readiness")
+    else:
+        READINESS.set("queue", False, "skipped: migrations did not complete")
+
+    global _embedded_worker, _queue_gauge_task
+    if settings.ingest_embedded_worker:
+        _embedded_worker = Consumer()
+        await _embedded_worker.start()
+        logger.info("embedded worker started (ingest_embedded_worker=true) — for production, "
+                   "deploy dedicated `python -m di.worker` processes instead")
+    else:
+        # No embedded worker's reaper loop to keep the queue gauges warm on this process — refresh
+        # them here instead, so /metrics still shows live depth/age if every dedicated worker dies
+        # (interaction 16: the exact incident the gauge exists to catch).
+        _queue_gauge_task = asyncio.create_task(_refresh_queue_gauges(), name="queue-gauge-refresh")
+
+
+async def _refresh_queue_gauges() -> None:
+    settings = get_settings()
+    interval = max(5.0, settings.job_reaper_interval_seconds)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            observability.set_queue_stats(await jobs.queue_stats())
+        except Exception:  # noqa: BLE001 - a metrics refresh must never crash the process
+            logger.warning("queue gauge refresh failed", exc_info=True)
+
 
 async def _shutdown() -> None:
-    await ingest_runner.drain()
+    global _embedded_worker, _queue_gauge_task
+    if _embedded_worker is not None:
+        await _embedded_worker.drain()
+        _embedded_worker = None
+    if _queue_gauge_task is not None:
+        _queue_gauge_task.cancel()
+        with contextlib.suppress(BaseException):
+            await _queue_gauge_task
+        _queue_gauge_task = None
+    await close_worker_pool()
     await audit.stop_writer()
     await close_pool()
 

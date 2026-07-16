@@ -171,7 +171,7 @@ class AccessLogWriter:
             logger.error("access-log flush failed for %d record(s): %s", len(batch), exc)
 
 
-# Module-level singleton, matching di.ingest_runner's pattern.
+# Module-level singleton, matching the app's other lifespan-owned background components.
 _writer: AccessLogWriter | None = None
 
 

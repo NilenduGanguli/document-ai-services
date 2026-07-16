@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import base64
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from di.config import get_settings
 from di.db import acquire, embedding_dim, pgvector_available, vec_to_pg
 from di.models import ARep, ClientFact, DocumentMeta, GateResult, KNode
+from di.subtree import versioning
 
 # Column order for knode inserts WITHOUT the runtime embedding column.
 _KNODE_COLS = (
@@ -163,28 +165,106 @@ async def get_current_version(client_id: str, doc_id: str) -> dict[str, Any] | N
         return dict(row) if row else None
 
 
-async def create_version(client_id: str, doc_id: str, *, content_hash: str, version_no: int,
-                         supersedes_id: str | None, changed_fields: list[dict] | None = None,
-                         created_by: str | None = None) -> str:
-    """Insert a new version row and flip is_current (one current per doc)."""
+@dataclass(frozen=True)
+class VersionResult:
+    """Outcome of :func:`create_version`'s locked decide-and-insert — the single authoritative
+    source of version identity for the rest of the pipeline. Callers must not independently
+    pre-compute a version plan and use it after this returns; threading a stale, pre-lock decision
+    through ltree paths / done events / supersedes_id is exactly the bug this design closes."""
+
+    version_id: str
+    version_no: int
+    is_noop: bool
+    #: True when this resumes an INCOMPLETE version from an interrupted at-least-once retry — the
+    #: caller must delete that version's existing knode/arep rows (see
+    #: :func:`delete_version_artifacts`) before rebuilding the subtree.
+    resume: bool
+    supersedes_no: int | None = None
+
+
+async def create_version(client_id: str, doc_id: str, *, content_hash: str,
+                         created_by: str | None = None) -> VersionResult:
+    """Atomically decide AND insert/reuse the version for this upload.
+
+    Runs under a per-document advisory transaction lock so two concurrent ingests for the SAME
+    document (already possible today at ingest_concurrency > 1; multiplied across workers by the
+    durable queue) cannot both read a stale "current" row and independently compute the same
+    version_no. The lock also makes the decision safe to re-derive from a fresh read every time —
+    no caller-supplied ``version_no`` parameter exists anymore.
+    """
     s = _schema()
-    version_id = str(uuid.uuid4())
+    async with acquire(client_id) as conn, conn.transaction():
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", f"{s}:{client_id}:{doc_id}")
+        current = await conn.fetchrow(
+            f'SELECT * FROM "{s}".doc_version WHERE client_id = $1 AND doc_id = $2 AND is_current',
+            client_id, doc_id,
+        )
+        plan = versioning.decide_version(
+            content_hash,
+            current["version_no"] if current else None,
+            current["content_hash"] if current else None,
+            current_complete=bool(current["ingest_complete"]) if current else True,
+        )
+        if plan.is_noop:
+            return VersionResult(version_id=str(current["id"]), version_no=plan.version_no,
+                                 is_noop=True, resume=False)
+        if plan.resume:
+            return VersionResult(version_id=str(current["id"]), version_no=plan.version_no,
+                                 is_noop=False, resume=True)
+
+        version_id = str(uuid.uuid4())
+        await conn.execute(
+            f'UPDATE "{s}".doc_version SET is_current = false '
+            "WHERE client_id = $1 AND doc_id = $2 AND is_current",
+            client_id, doc_id,
+        )
+        await conn.execute(
+            f'INSERT INTO "{s}".doc_version '
+            "(id, client_id, doc_id, version_no, content_hash, supersedes, is_current, "
+            " ingest_complete, created_by) "
+            "VALUES ($1,$2,$3,$4,$5,$6,true,false,$7)",
+            version_id, client_id, doc_id, plan.version_no, content_hash,
+            str(current["id"]) if current else None, created_by,
+        )
+        return VersionResult(version_id=version_id, version_no=plan.version_no, is_noop=False,
+                             resume=False, supersedes_no=plan.supersedes_no)
+
+
+async def delete_version_artifacts(client_id: str, version_id: str) -> None:
+    """Delete a version's knode/arep rows, so a resumed at-least-once retry rebuilds the subtree
+    from scratch instead of duplicating rows on top of a partial prior attempt (knode/arep inserts
+    are plain INSERTs with fresh UUIDs — not idempotent on their own)."""
+    s = _schema()
+    async with acquire(client_id) as conn, conn.transaction():
+        await conn.execute(
+            f'DELETE FROM "{s}".arep WHERE client_id = $1 AND version_id = $2',
+            client_id, version_id)
+        await conn.execute(
+            f'DELETE FROM "{s}".knode WHERE client_id = $1 AND version_id = $2',
+            client_id, version_id)
+
+
+async def delete_version_areps(client_id: str, version_id: str) -> None:
+    """Delete only a version's arep rows — the deferred 'arep' job kind's own idempotent-by-
+    replace step, distinct from :func:`delete_version_artifacts` (which also clears knodes and is
+    for the ingest job's resume path, not a retried arep job whose knodes are already correct)."""
+    s = _schema()
     async with acquire(client_id) as conn:
-        async with conn.transaction():
-            await conn.execute(
-                f'UPDATE "{s}".doc_version SET is_current = false '
-                "WHERE client_id = $1 AND doc_id = $2 AND is_current",
-                client_id, doc_id,
-            )
-            await conn.execute(
-                f'INSERT INTO "{s}".doc_version '
-                "(id, client_id, doc_id, version_no, content_hash, supersedes, is_current, "
-                " changed_fields, created_by) "
-                "VALUES ($1,$2,$3,$4,$5,$6,true,$7,$8)",
-                version_id, client_id, doc_id, version_no, content_hash, supersedes_id,
-                changed_fields or [], created_by,
-            )
-    return version_id
+        await conn.execute(
+            f'DELETE FROM "{s}".arep WHERE client_id = $1 AND version_id = $2',
+            client_id, version_id)
+
+
+async def mark_version_complete(client_id: str, version_id: str) -> None:
+    """Flip ``ingest_complete`` true — called after knodes/areps/merge all succeed, so the noop
+    check (``is_current AND ingest_complete``) only ever fast-paths a truly finished version."""
+    s = _schema()
+    async with acquire(client_id) as conn:
+        await conn.execute(
+            f'UPDATE "{s}".doc_version SET ingest_complete = true '
+            "WHERE client_id = $1 AND id = $2",
+            client_id, version_id)
 
 
 # ---------------------------------------------------------------------------
@@ -793,11 +873,12 @@ async def hybrid_search(client_id: str, *, query_text: str, query_embedding: lis
 
 # expose for callers that need the live dim
 __all__ = [
-    "clamp_limit", "clear_adjudication", "create_version", "decode_cursor", "delete_document",
-    "embedding_dim", "encode_cursor", "fetch_access_log", "fetch_adjudication_events",
-    "fetch_adjudications", "fetch_areps", "fetch_client_facts", "fetch_merged_facts", "fetch_node",
-    "fetch_subtree", "fetch_tenant_policy", "find_document", "get_current_version", "get_document",
+    "VersionResult", "clamp_limit", "clear_adjudication", "create_version", "decode_cursor",
+    "delete_document", "delete_version_areps", "delete_version_artifacts", "embedding_dim",
+    "encode_cursor", "fetch_access_log", "fetch_adjudication_events", "fetch_adjudications",
+    "fetch_areps", "fetch_client_facts", "fetch_merged_facts", "fetch_node", "fetch_subtree",
+    "fetch_tenant_policy", "find_document", "get_current_version", "get_document",
     "hybrid_search", "insert_areps", "insert_document", "insert_knodes", "list_documents",
-    "list_version_changes", "purge_client", "record_decision_trace", "replace_merged_facts",
-    "upsert_adjudication", "upsert_tenant_policy",
+    "list_version_changes", "mark_version_complete", "purge_client", "record_decision_trace",
+    "replace_merged_facts", "upsert_adjudication", "upsert_tenant_policy",
 ]

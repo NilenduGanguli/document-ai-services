@@ -54,3 +54,34 @@ async def get_job(
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return job
+
+
+@router.post("/jobs/{job_id}/retry", response_model=Job)
+async def retry_job(
+    job_id: str,
+    client_id: str,
+    principal: Principal = Depends(require_scope("admin")),  # noqa: B008
+) -> Job:
+    """Requeue a dead-lettered job for another attempt (attempts reset to 0). 404 if the job
+    does not exist for this tenant or is not currently 'dead'."""
+    authorize_client(principal, client_id)
+    job = await jobs_mod.retry(client_id, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found or not in 'dead' status")
+    return job
+
+
+@router.post("/jobs/{job_id}/cancel", response_model=Job)
+async def cancel_job(
+    job_id: str,
+    client_id: str,
+    principal: Principal = Depends(require_scope("admin")),  # noqa: B008
+) -> Job:
+    """Cancel a job that has not started yet. 'queued' -> 'canceled' only — a job already
+    claimed by a worker must finish or be reclaimed by the reaper; there is no preemption. 404 if
+    the job does not exist for this tenant or is not currently 'queued'."""
+    authorize_client(principal, client_id)
+    job = await jobs_mod.cancel(client_id, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found or not in 'queued' status")
+    return job

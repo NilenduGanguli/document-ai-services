@@ -145,6 +145,74 @@ async def acquire(client_id: str | None = None) -> AsyncIterator[asyncpg.Connect
                 await conn.execute("SELECT set_config('app.current_client_id', '', false)")
 
 
+_worker_pool: asyncpg.Pool | None = None
+
+
+async def init_worker_pool(settings: Settings | None = None) -> asyncpg.Pool:
+    """A second pool authenticated as the worker-role login (``di_worker_login``), separate from
+    the API's runtime pool (``di_app``).
+
+    Needed only for ``di_job``'s cross-tenant claim/heartbeat/reap queries — di_job's role-targeted
+    ``worker_claim`` policy (``TO di_worker``, shipped in 006_roles_and_grants.sql) grants
+    unconditional visibility to members of the ``di_worker`` group role, which ``di_app`` is
+    deliberately NOT a member of. A dedicated worker process typically points ``PG_USER`` itself
+    at ``di_worker_login`` (making this pool's credentials identical to the main one); the
+    embedded/compose worker needs this pool distinct, since the API's own pool must stay scoped to
+    ``di_app`` for request handling.
+    """
+    global _worker_pool
+    if _worker_pool is not None:
+        return _worker_pool
+    settings = settings or get_settings()
+    _worker_pool = await asyncpg.create_pool(
+        host=settings.pg_host,
+        port=settings.pg_port,
+        user=settings.pg_worker_user or settings.pg_user,
+        password=settings.pg_worker_password or settings.pg_password or None,
+        database=settings.pg_database,
+        ssl=_ssl_context(settings),
+        min_size=1,
+        max_size=max(2, settings.job_claim_batch),
+        command_timeout=60,
+        max_inactive_connection_lifetime=300,
+        init=_init_conn,
+    )
+    return _worker_pool
+
+
+async def close_worker_pool() -> None:
+    global _worker_pool
+    if _worker_pool is not None:
+        await _worker_pool.close()
+        _worker_pool = None
+
+
+@asynccontextmanager
+async def acquire_queue(client_id: str | None = None) -> AsyncIterator[asyncpg.Connection]:
+    """Like :func:`acquire`, but checks out from the worker-role pool (:func:`init_worker_pool`).
+
+    ``client_id=None`` (the claim/heartbeat/reap/queue_stats case) binds no tenant GUC at all and
+    relies purely on di_job's ``worker_claim`` policy for cross-tenant visibility — there is no
+    GUC-trust mechanism here (an earlier draft of this design used one; it was rejected because any
+    ``di_app_rw`` session could set the same GUC for itself). ``client_id=<tenant>`` binds the GUC
+    exactly like :func:`acquire`, for the worker's tenant-scoped pipeline writes (``di_worker_login``
+    is also a ``di_app_rw`` member, so every tenant-table grant applies identically to ``di_app``).
+    """
+    settings = get_settings()
+    pool = await init_worker_pool(settings)
+    async with pool.acquire() as conn:
+        await _init_conn(conn)
+        bound = False
+        if settings.rls_enabled and client_id is not None:
+            await conn.execute("SELECT set_config('app.current_client_id', $1, false)", client_id)
+            bound = True
+        try:
+            yield conn
+        finally:
+            if bound:
+                await conn.execute("SELECT set_config('app.current_client_id', '', false)")
+
+
 async def _discover_pgvector(conn: asyncpg.Connection) -> str | None:
     global _pgvector_schema, _pgvector_checked
     if _pgvector_checked:
