@@ -9,15 +9,20 @@ fuses the legs with Reciprocal Rank Fusion.
 from __future__ import annotations
 
 import base64
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+import asyncpg
+
 from di.config import get_settings
 from di.db import acquire, embedding_dim, pgvector_available, vec_to_pg
 from di.models import ARep, ClientFact, DocumentMeta, GateResult, KNode
 from di.subtree import versioning
+
+logger = logging.getLogger(__name__)
 
 # Column order for knode inserts WITHOUT the runtime embedding column.
 _KNODE_COLS = (
@@ -191,44 +196,64 @@ async def create_version(client_id: str, doc_id: str, *, content_hash: str,
     durable queue) cannot both read a stale "current" row and independently compute the same
     version_no. The lock also makes the decision safe to re-derive from a fresh read every time —
     no caller-supplied ``version_no`` parameter exists anymore.
+
+    The ``doc_version_client_doc_no`` unique index (migration 011) is a backstop, not the primary
+    correctness mechanism — every caller that reaches this function is already serialized by the
+    advisory lock above. It exists for writers outside that guarantee (a still-deploying replica
+    running pre-010 code with no lock, mid rolling-upgrade). On ``UniqueViolationError`` this
+    retries once against a fresh read, degrading to noop if the winner already wrote the identical
+    content hash.
     """
     s = _schema()
-    async with acquire(client_id) as conn, conn.transaction():
-        await conn.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", f"{s}:{client_id}:{doc_id}")
-        current = await conn.fetchrow(
-            f'SELECT * FROM "{s}".doc_version WHERE client_id = $1 AND doc_id = $2 AND is_current',
-            client_id, doc_id,
-        )
-        plan = versioning.decide_version(
-            content_hash,
-            current["version_no"] if current else None,
-            current["content_hash"] if current else None,
-            current_complete=bool(current["ingest_complete"]) if current else True,
-        )
-        if plan.is_noop:
-            return VersionResult(version_id=str(current["id"]), version_no=plan.version_no,
-                                 is_noop=True, resume=False)
-        if plan.resume:
-            return VersionResult(version_id=str(current["id"]), version_no=plan.version_no,
-                                 is_noop=False, resume=True)
+    for attempt in range(2):
+        try:
+            async with acquire(client_id) as conn, conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"{s}:{client_id}:{doc_id}")
+                current = await conn.fetchrow(
+                    f'SELECT * FROM "{s}".doc_version '
+                    "WHERE client_id = $1 AND doc_id = $2 AND is_current",
+                    client_id, doc_id,
+                )
+                plan = versioning.decide_version(
+                    content_hash,
+                    current["version_no"] if current else None,
+                    current["content_hash"] if current else None,
+                    current_complete=bool(current["ingest_complete"]) if current else True,
+                )
+                if plan.is_noop:
+                    return VersionResult(version_id=str(current["id"]), version_no=plan.version_no,
+                                         is_noop=True, resume=False)
+                if plan.resume:
+                    return VersionResult(version_id=str(current["id"]), version_no=plan.version_no,
+                                         is_noop=False, resume=True)
 
-        version_id = str(uuid.uuid4())
-        await conn.execute(
-            f'UPDATE "{s}".doc_version SET is_current = false '
-            "WHERE client_id = $1 AND doc_id = $2 AND is_current",
-            client_id, doc_id,
-        )
-        await conn.execute(
-            f'INSERT INTO "{s}".doc_version '
-            "(id, client_id, doc_id, version_no, content_hash, supersedes, is_current, "
-            " ingest_complete, created_by) "
-            "VALUES ($1,$2,$3,$4,$5,$6,true,false,$7)",
-            version_id, client_id, doc_id, plan.version_no, content_hash,
-            str(current["id"]) if current else None, created_by,
-        )
-        return VersionResult(version_id=version_id, version_no=plan.version_no, is_noop=False,
-                             resume=False, supersedes_no=plan.supersedes_no)
+                version_id = str(uuid.uuid4())
+                await conn.execute(
+                    f'UPDATE "{s}".doc_version SET is_current = false '
+                    "WHERE client_id = $1 AND doc_id = $2 AND is_current",
+                    client_id, doc_id,
+                )
+                await conn.execute(
+                    f'INSERT INTO "{s}".doc_version '
+                    "(id, client_id, doc_id, version_no, content_hash, supersedes, is_current, "
+                    " ingest_complete, created_by) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,true,false,$7)",
+                    version_id, client_id, doc_id, plan.version_no, content_hash,
+                    str(current["id"]) if current else None, created_by,
+                )
+                return VersionResult(version_id=version_id, version_no=plan.version_no,
+                                     is_noop=False, resume=False, supersedes_no=plan.supersedes_no)
+        except asyncpg.UniqueViolationError:
+            if attempt == 1:
+                raise
+            logger.warning(
+                "create_version: unique-index race on (client_id=%s doc_id=%s) despite the "
+                "advisory lock — a non-locked writer is still active; retrying once",
+                client_id, doc_id,
+            )
+    raise AssertionError("unreachable: loop always returns or raises")  # pragma: no cover
 
 
 async def delete_version_artifacts(client_id: str, version_id: str) -> None:
