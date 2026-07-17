@@ -318,8 +318,16 @@ async def _shutdown() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await _startup()
+    # Starlette does not run the lifespan of a mounted sub-app, so the MCP streamable-HTTP session
+    # manager (created in create_app when the endpoint is mounted) must be run here in the parent
+    # lifespan, or /mcp requests would 500 with "Task group is not initialized".
+    mcp_server = getattr(app.state, "mcp", None)
     try:
-        yield
+        if mcp_server is not None:
+            async with mcp_server.session_manager.run():
+                yield
+        else:
+            yield
     finally:
         await _shutdown()
 
@@ -435,8 +443,44 @@ def create_app() -> FastAPI:
     app.include_router(nodes.router)
     app.include_router(admin.router)
 
+    _maybe_mount_mcp(app, settings)
     _mount_frontend(app)
     return app
+
+
+def _maybe_mount_mcp(app: FastAPI, settings) -> None:
+    """Mount the agent-facing MCP endpoint at /mcp, in the same process/container as the API.
+
+    Kept fail-open like the routers: if the ``mcp`` package is absent or the server cannot be
+    built, the app still boots (MCP simply unavailable) and readiness records why. The endpoint is
+    never a REQUIRED_COMPONENT, so it never gates /readyz. The session manager it needs is started
+    by the lifespan above (``app.state.mcp``).
+    """
+    if not settings.mcp_enabled:
+        READINESS.set("mcp", True, "disabled (MCP_ENABLED=false)", enabled=False)
+        return
+    try:
+        from starlette.responses import RedirectResponse
+
+        from di.mcp import build_mcp
+        mcp_server = build_mcp()
+        app.state.mcp = mcp_server
+        app.mount("/mcp", mcp_server.streamable_http_app())
+
+        # Starlette's Mount("/mcp") only matches "/mcp/..."; a bare "/mcp" would otherwise fall
+        # through to the SPA catch-all (di._mount_frontend) and 405 for the transport's POST.
+        # Register an explicit bare-path redirect BEFORE that catch-all (this runs before
+        # _mount_frontend) so agents can point at either /mcp or /mcp/ — the MCP client follows the
+        # 307 (it sets follow_redirects=True), preserving method and body.
+        @app.api_route("/mcp", methods=["GET", "POST", "DELETE"], include_in_schema=False)
+        async def _mcp_root_redirect() -> RedirectResponse:
+            return RedirectResponse(url="/mcp/", status_code=307)
+    except Exception as exc:  # noqa: BLE001 - a broken/absent MCP mount must not stop the app
+        READINESS.set("mcp", True, f"unavailable: {exc}", enabled=False)
+        logger.warning("MCP endpoint not mounted: %s", exc, exc_info=True)
+        return
+    READINESS.set("mcp", True, "mounted at /mcp", enabled=True)
+    logger.info("MCP endpoint mounted at /mcp")
 
 
 app = create_app()

@@ -109,6 +109,12 @@ class Settings(BaseSettings):
     azure_vision_endpoint: str = ""
     azure_vision_key: str = ""
 
+    # --- MCP endpoint (agent-facing tool surface; mounts on the same app/container) ---
+    # When true, di.app mounts a Model Context Protocol server at /mcp so other agents can call
+    # the read/search/ingest tools. It reuses the same X-API-KEY auth and per-tenant RLS as the
+    # REST API — no new isolation surface. Set false to omit the mount entirely.
+    mcp_enabled: bool = True
+
     # --- AuthN / AuthZ ---
     # Disable ONLY for a local demo; every /api/v1 route is unauthenticated when false.
     auth_enabled: bool = True

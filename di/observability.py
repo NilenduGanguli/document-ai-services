@@ -60,6 +60,7 @@ KNOWN_COMPONENTS: tuple[str, ...] = (
     "auth",
     "audit",
     "queue",
+    "mcp",
 )
 
 
