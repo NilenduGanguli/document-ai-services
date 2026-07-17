@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 _URI_SCHEME = "s3://"
 _MISSING_BOTO3 = (
     "boto3 is required for blob_backend='s3' but is not installed — "
-    "install the optional extra: pip install 'document-intelligence[s3]'"
+    "install the optional extra: pip install 'document-ai-services[s3]'"
 )
 #: S3 DeleteObjects accepts at most 1000 keys per request.
 _DELETE_BATCH = 1000

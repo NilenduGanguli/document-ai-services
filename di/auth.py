@@ -53,7 +53,7 @@ MAX_ROTATION_OVERLAP_HOURS = 168  # 1 week
 
 _LOCAL_DEV_KEY_ID = "local-dev"
 _BOOTSTRAP_NAME = "bootstrap"
-_WWW_AUTHENTICATE = f'ApiKey realm="document-intelligence", header="{API_KEY_HEADER}"'
+_WWW_AUTHENTICATE = f'ApiKey realm="document-ai-services", header="{API_KEY_HEADER}"'
 
 # Columns safe to expose — deliberately excludes key_hash.
 _PUBLIC_COLS = (

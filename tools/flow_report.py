@@ -1,4 +1,4 @@
-"""Exercise every Document Intelligence API flow against a running instance and write a report.
+"""Exercise every Document AI Services API flow against a running instance and write a report.
 
 Usage:
     DI_BASE_URL=http://localhost:8080 python tools/flow_report.py
@@ -84,7 +84,7 @@ def main() -> int:
     with httpx.Client(timeout=10) as c:
         health = c.get(f"{BASE}/health").json()
 
-    w("# Document Intelligence — Local Flow Test Report")
+    w("# Document AI Services — Local Flow Test Report")
     w("")
     w(f"- **Target:** `{BASE}`  ·  **Client:** `{CLIENT}`")
     w(f"- **Service health:** `{json.dumps(health)}`")

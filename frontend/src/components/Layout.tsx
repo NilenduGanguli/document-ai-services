@@ -169,7 +169,7 @@ export function Layout(): JSX.Element {
             <IconLogo size={19} />
           </span>
           <div>
-            <div className="brand-title">Document Intelligence</div>
+            <div className="brand-title">Document AI Services</div>
             <div className="brand-sub">KYC console</div>
           </div>
         </div>

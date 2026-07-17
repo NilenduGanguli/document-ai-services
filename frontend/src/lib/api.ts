@@ -1,5 +1,5 @@
 /**
- * Typed API client for the document-intelligence backend.
+ * Typed API client for the document-ai-services backend.
  *
  * Every `/api/v1` call carries the `X-API-KEY` header taken from the key the
  * operator pastes into the header bar (persisted in localStorage). Non-2xx

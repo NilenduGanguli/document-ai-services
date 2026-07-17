@@ -58,7 +58,7 @@ async def _embed_query(query: str) -> list[float] | None:
 def build_mcp() -> FastMCP:
     """Construct the MCP server and register every tool. Called once by di.app.create_app."""
     mcp = FastMCP(
-        name="document-intelligence",
+        name="document-ai-services",
         instructions=(
             "Per-client KYC knowledge trees from documents. Every tool needs a client_id (the "
             "tenant) and the same X-API-KEY you would use over REST; results are tenant-isolated "

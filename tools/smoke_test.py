@@ -111,7 +111,7 @@ def main() -> int:
     args = ap.parse_args()
 
     client = httpx.Client(follow_redirects=True)
-    print(f"\nDocument Intelligence smoke test → {BASE}  (client_id={CLIENT})\n")
+    print(f"\nDocument AI Services smoke test → {BASE}  (client_id={CLIENT})\n")
 
     # ---------------------------------------------------------------- readiness
     print("readiness")

@@ -1,5 +1,5 @@
 /**
- * Wire types for the document-intelligence API (`/api/v1`).
+ * Wire types for the document-ai-services API (`/api/v1`).
  *
  * These mirror the server-side projections in `di/serving.py` and the enums in
  * `di/models.py`. Fields the server may omit are optional or nullable — the API

@@ -1,4 +1,4 @@
-# Local stack: Postgres-with-pgvector + the Document Intelligence app + a durable-queue worker +
+# Local stack: Postgres-with-pgvector + the Document AI Services app + a durable-queue worker +
 # a mock Azure OCR.
 #
 #   docker compose up --build                 # default: raw bytes stored in Postgres (bytea)

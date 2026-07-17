@@ -1,9 +1,9 @@
 {
-  "name": "document-intelligence-console",
+  "name": "document-ai-services-console",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "KYC document-intelligence console — React + Vite SPA served by FastAPI from frontend/dist.",
+  "description": "Document AI Services console — React + Vite SPA served by FastAPI from frontend/dist.",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

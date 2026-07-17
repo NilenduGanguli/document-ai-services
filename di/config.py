@@ -61,7 +61,7 @@ class Settings(BaseSettings):
                 file_secret_settings)
 
     # --- App ---
-    app_name: str = "document-intelligence"
+    app_name: str = "document-ai-services"
     di_env: str = "local"                    # local | dev | staging | prod
     di_log_level: str = "INFO"
     di_executor_workers: int = 32

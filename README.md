@@ -1,6 +1,6 @@
-# Document Intelligence
+# Document AI Services
 
-Unified document-intelligence platform for banking KYC. It turns a client's documents
+Document AI Services — a platform for banking KYC. It turns a client's documents
 (PDF / DOCX / JPEG / PNG) into a **versioned, per-client knowledge tree** and serves it to
 downstream services via an API for search, single-document Q&A, and structured fact retrieval —
 PII-safe throughout.

@@ -1,7 +1,7 @@
 [project]
-name = "document-intelligence"
+name = "document-ai-services"
 version = "0.1.0"
-description = "Unified document-intelligence platform: per-client knowledge trees from KYC documents (US/CA/MX, EN/ES)."
+description = "Document AI Services: per-client knowledge trees from KYC documents (US/CA/MX, EN/ES)."
 requires-python = ">=3.11"
 readme = "README.md"
 
