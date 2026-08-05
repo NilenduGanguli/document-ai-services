@@ -120,6 +120,8 @@ erDiagram
         text sensitivity_bucket
         text gate_decision
         text ocr_engine
+        text blob_uri "current bytes: s3://|pg://|file://"
+        text blob_backend
         text ocr_text "excluded from API reads"
     }
     doc_version {
@@ -130,6 +132,8 @@ erDiagram
         text content_hash
         bool is_current
         bool ingest_complete "closes the crash-window"
+        text blob_uri "this version's bytes (012)"
+        text blob_backend
     }
     knode {
         uuid id
@@ -247,7 +251,7 @@ sequenceDiagram
 
 1. **Accept** (`di/routers/ingest.py`): `authorize_client` → **idempotency pre-check before quota** (a retry of an already-accepted submit must never `429`) → per-tenant admission quota → `content_hash` → **blob-at-accept** (bytes are made durable *before* the 202 and *before* the job row, so a crash between accept and claim can never lose the payload the bank was told was accepted) → `jobs.enqueue`. `BLOB_BACKEND=none` **rejects** async ingest with `503`.
 2. **Claim** (`di/worker.py`): the worker claims with `FOR UPDATE SKIP LOCKED` under a per-tenant running cap (§6).
-3. **Version decision** (`di/store.py:create_version`): under a **per-document advisory lock**, decide *new version* / *noop* (identical content already complete) / *resume* (identical content but a previous attempt crashed mid-pipeline → rebuild). Returns a `VersionResult` that is the single source of version identity for everything downstream.
+3. **Version decision** (`di/store.py:create_version`): under a **per-document advisory lock**, decide *new version* / *noop* (identical content already complete) / *resume* (identical content but a previous attempt crashed mid-pipeline → rebuild). Returns a `VersionResult` that is the single source of version identity for everything downstream. A newly-inserted version also records the payload locator (`blob_uri`, `blob_backend` — migration 012); noop/resume reuse the existing row, which already carries the identical content-addressed pointer.
 4. **OCR** (`di/ocr/vision.py`): engine resolution — **Azure Vision Read** for images/scanned PDFs when configured; **pypdf** text-layer for digital PDFs (free, offline); **tesseract** fallback; **docx** extraction; else empty. OCR **never raises** (degrades). It runs **off the event loop** (`anyio.to_thread`) so a ~60s Azure round-trip never blocks concurrent reads.
 5. **Gate** (`di/gate/`): language profile → classifier (doc type + confidence) → PII sweep → **routing**: `SEND_TO_LLM` (low-sensitivity, confident, gate open) / `REDACT_THEN_SEND` (inactive in v1) / `DETERMINISTIC_ONLY` (anything sensitive or low-confidence). This is the **egress control**: only `SEND_TO_LLM` documents ever reach the model gateway.
 6. **Extract**: deterministic ID extractors always run (passport MRZ, US SSN/EIN/ITIN, CA SIN/BN, MX CURP/RFC/INE — via `python-stdnum` checksums); LLM extraction runs **only** when the gate allowed egress.
@@ -255,6 +259,20 @@ sequenceDiagram
 8. **Accessibility reps**: when `AREP_ASYNC=true`, arep generation (5 rep types × N content nodes, each an LLM call) is deferred to a separate **`arep` queue job** (idempotent per version) instead of blocking the ingest job.
 9. **Merge**: recompute the client's cross-document merged facts (confidence-weighted, multi-valued via `instance_key`), under a **per-client advisory lock** so two workers finishing different docs for one client can't publish a stale merged view.
 10. **Done**: `mark_version_complete` (flips `ingest_complete=true`) then the terminal `done` event.
+
+### Where the payload lives, and where that fact is recorded
+
+The blob store is pluggable (`BLOB_BACKEND` = `postgres` | `local` | `s3` | `none`) behind one narrow four-verb contract (`di/storage/base.py`), so no pipeline code knows which is configured. With `s3` (real AWS, or the MinIO service in `docker-compose.yml` under the opt-in `s3` profile) objects land at `s3://$S3_BUCKET/$S3_PREFIX/<url-encoded client_id>/<sha256>/<filename>`. Two invariants hold for **every** backend: the tenant segment is applied by the store rather than trusted from the key, and a presented URI is re-checked against the calling tenant before any read — so a leaked URI is not a capability.
+
+The locator is **persisted at three levels**, each answering a different question:
+
+| Where | Written at | Answers |
+|---|---|---|
+| `di_job.payload` (jsonb) | Accept, *before* the `202` | "The API said 202 — where are the bytes the worker must fetch?" Queue-internal; withheld from the public `Job` model (`di.jobs._JOB_COLS`). |
+| `di_documents.blob_uri` / `blob_backend` | `store.insert_document` | "Where are this document's **current** bytes?" Upserted per logical document, so it is overwritten by the next version. Returned to authorized callers by `GET /api/v1/clients/{client_id}/documents`. |
+| `doc_version.blob_uri` / `blob_backend` (**012**) | `store.create_version`, on insert | "Where are the bytes that produced **version 3**?" Pinned per immutable version, so it survives being superseded. |
+
+Retention is an operator decision, not a product one: `BLOB_RETAIN_AFTER_INGEST=false` deletes the object once its job succeeds (the recorded URIs then describe bytes that intentionally no longer exist), `BLOB_BACKEND=none` never retains and therefore **rejects async ingest with `503`** rather than issuing a 202 for bytes no worker could ever fetch. Tenant erasure sweeps objects by tenant prefix (`BlobStore.delete_client()`).
 
 ---
 
@@ -609,6 +627,7 @@ The shipped implementation took the recommended default for each original open q
 | `008_multi_valued_facts.sql` | `instance_key` + `di_fact_adjudication`; `UNIQUE (client_id, attribute_key, instance_key)` |
 | `010_job_queue.sql` | Durable-queue columns on `di_job`, partial claim/lease indexes, `doc_version.ingest_complete` |
 | `011_doc_version_unique.sql` | `UNIQUE (client_id, doc_id, version_no)` backstop (shipped one release after 010's lock/retry code) |
+| `012_doc_version_blob.sql` | `doc_version.blob_uri` / `blob_backend` — the payload locator pinned per immutable version (`di_documents`' copy is upserted and only ever describes the current bytes) |
 
 ### 11.2 Selected configuration (di/config.py)
 
@@ -620,4 +639,4 @@ The shipped implementation took the recommended default for each original open q
 
 ---
 
-*Generated from the current codebase (`~/document_intelligence`, migrations 001–011). File/line references point at the source of each claim. The single-container role detail (§9, `di_worker_login`) and the MCP mount approach (§10) are verified against `docker/initdb/01_roles.sql` and `di/app.py` respectively; the MCP endpoint itself is a design to be implemented.*
+*Generated from the current codebase (`~/document_intelligence`, migrations 001–012). File/line references point at the source of each claim. The single-container role detail (§9, `di_worker_login`) and the MCP mount approach (§10) are verified against `docker/initdb/01_roles.sql` and `di/app.py` respectively; the MCP endpoint itself is a design to be implemented.*

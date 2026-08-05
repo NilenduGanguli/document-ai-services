@@ -53,6 +53,11 @@ class DocumentSummary(BaseModel):
     page_count: int | None = None
     mime: str | None = None
     sha256: str | None = None
+    #: Where the raw uploaded bytes were retained: the backend-qualified locator
+    #: (``s3://bucket/key``, ``pg://client/key``, ``file:///path``) and which backend it belongs
+    #: to. Null when ``BLOB_BACKEND=none`` (retention disabled). See ``store._DOC_LIST_COLS`` for
+    #: why the URI is safe to return to an authorized caller.
+    blob_uri: str | None = None
     blob_backend: str | None = None
     created_at: Any = None
     updated_at: Any = None

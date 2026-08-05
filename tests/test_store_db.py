@@ -87,3 +87,58 @@ async def test_store_round_trip():
         assert any(d["document_name"] == "passport.pdf" for d in docs)
     finally:
         await close_pool()
+
+
+@pytest.mark.asyncio
+async def test_blob_location_is_recorded_per_version():
+    """The payload locator survives being superseded (migration 012).
+
+    ``di_documents.blob_uri`` is UPSERTed per logical document, so after a second ingest it
+    describes only the current bytes. ``doc_version.blob_uri`` pins each version's own pointer, so
+    "produce the bytes that were ingested as version 1" stays a lookup rather than a re-derivation
+    of the content-addressed key.
+    """
+    from di import store
+    from di.db import close_pool, init_pool, run_migrations
+
+    try:
+        await init_pool()
+        await run_migrations()
+    except Exception as e:  # noqa: BLE001 - any connect/auth/DDL failure -> skip, not fail
+        pytest.skip(f"Postgres unavailable/unauthorized: {e}")
+
+    try:
+        cid = f"test-{uuid.uuid4().hex[:8]}"
+        h1, h2 = "aa" * 32, "bb" * 32
+        uri1 = f"s3://document-intelligence/documents/{cid}/{h1}/passport.pdf"
+        uri2 = f"s3://document-intelligence/documents/{cid}/{h2}/passport.pdf"
+
+        doc_id = await store.insert_document(DocumentMeta(
+            client_id=cid, document_name="passport.pdf", sha256=h1,
+            blob_uri=uri1, blob_backend="s3"))
+        v1 = await store.create_version(cid, doc_id, content_hash=h1,
+                                        blob_uri=uri1, blob_backend="s3")
+        await store.mark_version_complete(cid, v1.version_id)
+
+        current = await store.get_current_version(cid, doc_id)
+        assert current["blob_uri"] == uri1 and current["blob_backend"] == "s3"
+
+        # Second ingest of the same logical document: new bytes, new version.
+        await store.insert_document(DocumentMeta(
+            client_id=cid, document_name="passport.pdf", sha256=h2,
+            blob_uri=uri2, blob_backend="s3"))
+        v2 = await store.create_version(cid, doc_id, content_hash=h2,
+                                        blob_uri=uri2, blob_backend="s3")
+        assert v2.version_no == v1.version_no + 1
+
+        # The document row now points at v2's bytes only...
+        docs, _ = await store.list_documents(cid)
+        assert [d["blob_uri"] for d in docs if str(d["id"]) == doc_id] == [uri2]
+
+        # ...while each version keeps its own pointer.
+        changes, _ = await store.list_version_changes(cid, limit=10)
+        by_version = {c["version_no"]: c["blob_uri"] for c in changes if c["doc_id"] is not None}
+        assert by_version[v1.version_no] == uri1
+        assert by_version[v2.version_no] == uri2
+    finally:
+        await close_pool()

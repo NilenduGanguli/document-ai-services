@@ -51,15 +51,30 @@ into the console's header bar (or send it as `X-API-KEY`). Set `AUTH_ENABLED=fal
 throwaway local demo — it leaves every route open.
 
 ### Where the raw document bytes live
-Pick a blob backend with `BLOB_BACKEND`; the pipeline, deletion and tenant-purge paths all work
-identically across the three:
+Every upload is written to the configured blob store **before** the `202` is returned and before
+the `di_job` row exists (*blob-at-accept*) — a crash between accepting a document and a worker
+claiming it can never lose the payload the caller was told was accepted. Pick the backend with
+`BLOB_BACKEND`; the pipeline, deletion and tenant-purge paths all work identically across the four:
 ```bash
 docker compose up --build                  # postgres  — bytea in di_blob (default)
 BLOB_BACKEND=local docker compose up       # local     — a docker volume at /data/blobs
-docker compose --profile s3 up --build     # s3        — MinIO (console at :9001); use a real
+BLOB_BACKEND=s3 docker compose --profile s3 up --build
+                                           # s3        — MinIO (console at :9001); use a real
                                            #             bucket by setting S3_ENDPOINT/S3_BUCKET
 BLOB_BACKEND=none docker compose up        # none      — do not retain raw bytes at all
 ```
+The `s3` line needs **both** halves: `--profile s3` starts the bundled MinIO (bucket auto-created
+by `minio-init`), `BLOB_BACKEND=s3` points the app at it. Objects land at
+`s3://$S3_BUCKET/$S3_PREFIX/<client_id>/<sha256>/<filename>` — the tenant prefix is applied by the
+store, never taken from the key, so one tenant can never read another's object by presenting its
+URI.
+
+**Where the location is recorded.** The URI is persisted, not just logged: `di_job.payload` carries
+it from accept to worker claim, then `di_documents.blob_uri` / `blob_backend` record it on the
+document row and `doc_version.blob_uri` / `blob_backend` (migration 012) pin it per immutable
+version — the document row is upserted per logical document, so only the version row survives being
+superseded. Authorized callers see it on `GET /api/v1/clients/{client_id}/documents`. Production
+posture rejects `none` and `local` (see `di/posture.py`).
 
 ### Verify it end to end
 ```bash

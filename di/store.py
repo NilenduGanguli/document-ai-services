@@ -188,7 +188,8 @@ class VersionResult:
 
 
 async def create_version(client_id: str, doc_id: str, *, content_hash: str,
-                         created_by: str | None = None) -> VersionResult:
+                         created_by: str | None = None, blob_uri: str | None = None,
+                         blob_backend: str | None = None) -> VersionResult:
     """Atomically decide AND insert/reuse the version for this upload.
 
     Runs under a per-document advisory transaction lock so two concurrent ingests for the SAME
@@ -203,6 +204,19 @@ async def create_version(client_id: str, doc_id: str, *, content_hash: str,
     running pre-010 code with no lock, mid rolling-upgrade). On ``UniqueViolationError`` this
     retries once against a fresh read, degrading to noop if the winner already wrote the identical
     content hash.
+
+    Args:
+        blob_uri: Backend-qualified locator of the raw bytes this version was built from (migration
+            012). ``di_documents.blob_uri`` is UPSERTed per logical document and therefore only
+            ever describes the *current* bytes; recording it here keeps a superseded version's
+            payload addressable by lookup rather than by re-deriving the content-addressed key.
+            ``None`` when nothing was retained (``BLOB_BACKEND=none``) or when retention failed on
+            the deliberately non-fatal ``stream=true`` path.
+        blob_backend: Which backend that URI belongs to (postgres/local/s3/none).
+
+    Only the *insert* branch records these: a ``noop``/``resume`` returns the pre-existing row,
+    which was written from the identical ``content_hash`` and so already carries the identical
+    (content-addressed) pointer. Rows written before migration 012 keep NULL.
     """
     s = _schema()
     for attempt in range(2):
@@ -238,10 +252,10 @@ async def create_version(client_id: str, doc_id: str, *, content_hash: str,
                 await conn.execute(
                     f'INSERT INTO "{s}".doc_version '
                     "(id, client_id, doc_id, version_no, content_hash, supersedes, is_current, "
-                    " ingest_complete, created_by) "
-                    "VALUES ($1,$2,$3,$4,$5,$6,true,false,$7)",
+                    " ingest_complete, created_by, blob_uri, blob_backend) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,true,false,$7,$8,$9)",
                     version_id, client_id, doc_id, plan.version_no, content_hash,
-                    str(current["id"]) if current else None, created_by,
+                    str(current["id"]) if current else None, created_by, blob_uri, blob_backend,
                 )
                 return VersionResult(version_id=version_id, version_no=plan.version_no,
                                      is_noop=False, resume=False, supersedes_no=plan.supersedes_no)
@@ -553,10 +567,21 @@ async def fetch_node(client_id: str, node_id: str) -> dict[str, Any] | None:
 #: Columns returned by the document LIST endpoint. Deliberately excludes ocr_text / ocr_lines:
 #: shipping every page's raw OCR (and its PII) in a list response is both a payload and a
 #: disclosure problem. Fetch a single document to get the full OCR payload.
+#:
+#: ``blob_uri`` IS included (alongside the ``blob_backend`` that was always here): a caller who is
+#: authenticated and authorized to this client_id — and already receives the payload's ``sha256``
+#: — should be able to see WHERE its bytes were retained without an operator running SQL. The URI
+#: is not a capability: every backend re-checks tenant ownership of a presented URI before reading
+#: it (S3 by key prefix, Postgres by client segment, local by resolved path — see
+#: di/storage/*.py and the cross-tenant-URI tests), so a leaked URI grants nothing. Note this is
+#: the opposite call from ``di.jobs._JOB_COLS``, which withholds the job ``payload``: that payload
+#: is queue-internal state on a row the tenant does not own the semantics of, whereas this is the
+#: tenant's own document provenance. Under BLOB_BACKEND=local the URI is a container-absolute path
+#: (``file:///data/blobs/...``); di/posture.py already refuses that backend in production.
 _DOC_LIST_COLS = (
     "id, client_id, document_name, external_document_id, doc_type, doc_category, subject, "
     "jurisdiction, sensitivity_bucket, gate_decision, confidence, ocr_engine, page_count, "
-    "sha256, mime, blob_backend, created_at, updated_at"
+    "sha256, mime, blob_uri, blob_backend, created_at, updated_at"
 )
 
 

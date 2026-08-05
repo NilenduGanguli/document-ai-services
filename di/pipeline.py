@@ -263,7 +263,8 @@ async def ingest_document(
 
         # --- Authoritative version decision (locked; see store.create_version) ---
         version = await store.create_version(
-            client_id, doc_id, content_hash=content_hash, created_by=created_by)
+            client_id, doc_id, content_hash=content_hash, created_by=created_by,
+            blob_uri=blob_uri, blob_backend=blob_backend)
         if version.is_noop:
             observability.observe_ingest("noop")
             yield IngestEvent(stage="version", status="skip",

@@ -120,6 +120,45 @@ async def test_manifest(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_documents_surfaces_the_blob_location(monkeypatch):
+    """An authorized caller can see WHERE its document's raw bytes were retained.
+
+    The blob URI is tenant-scoped and every backend re-checks tenant ownership of a presented URI
+    before reading it (tests/test_storage.py), so returning it grants no access — it makes the
+    "the upload is stored, and here is where" story answerable through the API instead of only
+    through SQL.
+    """
+    row = {
+        "id": "00000000-0000-0000-0000-0000000000d1",
+        "client_id": "c1", "document_name": "passport.pdf", "external_document_id": None,
+        "doc_type": "PASSPORT", "sha256": "ab" * 32, "mime": "application/pdf",
+        "blob_uri": "s3://document-intelligence/documents/c1/" + "ab" * 32 + "/passport.pdf",
+        "blob_backend": "s3",
+    }
+
+    async def fake_list_documents(client_id, **kw):
+        return [row], None
+
+    monkeypatch.setattr(store, "list_documents", fake_list_documents)
+    # Called directly, so the Query()/None defaults FastAPI would resolve are passed explicitly.
+    res = await clients.get_documents("c1", limit=None, cursor=None, principal=_principal())
+
+    assert res.count == 1
+    doc = res.documents[0]
+    assert doc.blob_backend == "s3"
+    assert doc.blob_uri == row["blob_uri"]
+
+
+def test_document_list_columns_include_the_blob_location():
+    """The projection is an explicit column list, so a field on the response model that is not
+    selected would silently be None forever. Raw OCR stays excluded (payload + PII)."""
+    assert "blob_uri" in store._DOC_LIST_COLS  # noqa: SLF001 - the projection IS the unit here
+    assert "blob_backend" in store._DOC_LIST_COLS  # noqa: SLF001
+    assert "ocr_text" not in store._DOC_LIST_COLS  # noqa: SLF001
+    assert "ocr_lines" not in store._DOC_LIST_COLS  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_search_returns_ranked_hits(monkeypatch):
     async def fake_pgvector():
         return False  # skip embedding path

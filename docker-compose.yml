@@ -3,8 +3,12 @@
 #
 #   docker compose up --build                 # default: raw bytes stored in Postgres (bytea)
 #   BLOB_BACKEND=local docker compose up      # raw bytes on a docker volume
-#   docker compose --profile s3 up --build    # raw bytes in MinIO (S3-compatible)
+#   BLOB_BACKEND=s3 docker compose --profile s3 up --build   # raw bytes in MinIO (S3-compatible)
 #   docker compose up --build --scale worker=3   # demonstrate horizontal claim distribution
+#
+# BOTH halves of the s3 line matter and neither implies the other: `--profile s3` only STARTS
+# MinIO, and `BLOB_BACKEND=s3` only POINTS the app at it. The default backend is unchanged
+# (postgres) — the profile exists so the extra container is opt-in.
 #
 # The app applies migrations on startup (under a dedicated di_owner connection, advisory-locked)
 # and, because this DB ships pgvector, creates the vector extension, embedding columns and HNSW
@@ -63,10 +67,18 @@ x-di-env: &di-env
 
   # --- Blob storage: where the raw uploaded bytes live.
   # postgres (default) | local (docker volume at /data/blobs) | s3 (MinIO below) | none
+  #
+  # The S3_* values below are inert unless BLOB_BACKEND=s3 — they are wired here so switching
+  # backends is one env var, not an edit. Objects land at
+  # s3://$S3_BUCKET/$S3_PREFIX/<url-encoded client_id>/<sha256>/<filename>; the tenant segment is
+  # applied by the store, never taken from the key (di/storage/s3.py). Point S3_ENDPOINT/S3_BUCKET
+  # at a real bucket (and drop the static keys to use the default AWS credential chain) for a
+  # non-local deployment.
   BLOB_BACKEND: ${BLOB_BACKEND:-postgres}
   BLOB_LOCAL_DIR: /data/blobs
   S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
   S3_BUCKET: ${S3_BUCKET:-document-intelligence}
+  S3_PREFIX: ${S3_PREFIX:-documents}
   S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
   S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
   S3_REGION: us-east-1
@@ -177,7 +189,13 @@ services:
       retries: 20
 
   # S3-compatible object storage, for demonstrating BLOB_BACKEND=s3 with no AWS account.
-  # Enable with:  docker compose --profile s3 up --build
+  # Enable with:  BLOB_BACKEND=s3 docker compose --profile s3 up --build
+  #
+  # Deliberately NOT a depends_on of app/worker: those services are profile-less and must keep
+  # starting on the default (postgres) backend, where MinIO is not running at all. minio-init
+  # creates the bucket seconds after MinIO reports healthy, long before a document is posted; an
+  # ingest that somehow beats it fails closed with 503 ("could not durably store the upload") and
+  # /readyz reports the blob dependency down, rather than 202-ing bytes that were never stored.
   minio:
     image: minio/minio:latest
     profiles: ["s3"]

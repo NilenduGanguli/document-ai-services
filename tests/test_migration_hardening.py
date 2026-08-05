@@ -18,6 +18,7 @@ from di.config import get_settings
 
 _MIGRATIONS = Path(__file__).parent.parent / "di" / "migrations"
 _HARDENING = _MIGRATIONS / "005_hardening.sql"
+_VERSION_BLOB = _MIGRATIONS / "012_doc_version_blob.sql"
 
 #: tenant-scoped tables added by 005 — each MUST carry a tenant_isolation policy.
 _TENANT_TABLES = ("di_job", "di_blob", "di_fact_adjudication")
@@ -177,6 +178,53 @@ def test_change_seq_index_does_not_collide_with_the_sequence(sql: str) -> None:
     """Indexes and sequences share pg_class: an index named doc_version_change_seq would clash."""
     assert "CREATE INDEX IF NOT EXISTS doc_version_change_seq " not in sql
     assert "CREATE INDEX IF NOT EXISTS doc_version_client_change_seq" in sql
+
+
+# ---------------------------------------------------------------------------
+# 012_doc_version_blob.sql — the per-version payload locator
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def blob_sql() -> str:
+    """The raw text of 012_doc_version_blob.sql."""
+    return _VERSION_BLOB.read_text(encoding="utf-8")
+
+
+def test_012_alters_doc_version_rather_than_recreating_it(blob_sql: str) -> None:
+    """doc_version is a 002 table and exists in every deployed DB, so CREATE TABLE IF NOT EXISTS
+    would be a silent no-op there and the columns would never appear."""
+    assert "CREATE TABLE" not in blob_sql.upper()
+    assert "ALTER TABLE __SCHEMA__.doc_version" in blob_sql
+
+
+@pytest.mark.parametrize("column", ["blob_uri", "blob_backend"])
+def test_012_columns_are_guarded_by_if_not_exists(blob_sql: str, column: str) -> None:
+    """run_migrations re-applies every file on each boot — an unguarded ADD COLUMN crashes the
+    app on the second boot."""
+    assert re.search(rf"ADD COLUMN IF NOT EXISTS\s+{column}\s+text\b", blob_sql), column
+
+
+def test_012_schema_is_never_hardcoded(blob_sql: str) -> None:
+    """Same rule as 005: the __SCHEMA__ token is what db.py rewrites per deployment."""
+    configured = get_settings().pg_schema
+    assert f'"{configured}".' not in blob_sql, f"hardcoded schema {configured!r} — use __SCHEMA__"
+    assert "__SCHEMA__." in blob_sql
+
+
+def test_012_is_pure_ddl(blob_sql: str) -> None:
+    """A back-fill of the new columns would be DML, and 004 has already FORCE'd RLS by the time
+    migrations run — it would be silently filtered to zero rows under the production role."""
+    for verb in ("INSERT INTO", "UPDATE ", "DELETE FROM"):
+        assert verb not in blob_sql.upper().replace("-- ", ""), f"{verb.strip()} is unsafe here"
+
+
+def test_012_columns_match_the_di_documents_pair(sql: str, blob_sql: str) -> None:
+    """The version-level pointer must use the SAME column names/types 005 gave di_documents —
+    di/store.py reads both through one DocumentMeta shape, and a rename would split the story."""
+    for column in ("blob_uri", "blob_backend"):
+        assert re.search(rf"ADD COLUMN IF NOT EXISTS\s+{column}\s+text\b", sql), (
+            f"di_documents.{column} is the 005 precedent this file mirrors"
+        )
+        assert re.search(rf"ADD COLUMN IF NOT EXISTS\s+{column}\s+text\b", blob_sql), column
 
 
 def test_migration_is_pure_ddl(sql: str) -> None:
