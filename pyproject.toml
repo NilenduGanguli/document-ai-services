@@ -18,7 +18,13 @@ dependencies = [
     "sse-starlette>=2.0",
     "structlog>=24.1",
     "prometheus-client>=0.20",   # /metrics exposition (gate decisions, LLM egress, stage timings)
-    "mcp>=1.0",                  # Model Context Protocol server (agent-facing /mcp tool surface)
+    # Model Context Protocol server (agent-facing /mcp tool surface).
+    # Pinned <2 deliberately: di/mcp/server.py targets the 1.x API (mcp.server.fastmcp.FastMCP).
+    # 2.0 removed that module (FastMCP became mcp.server.mcpserver.MCPServer), so an
+    # unbounded ">=1.0" silently resolved to 2.x in the image and shipped a dead /mcp
+    # endpoint that only surfaced as "unavailable: No module named 'mcp.server.fastmcp'"
+    # in /readyz. Migrating to the 2.x API is separate work.
+    "mcp>=1.0,<2",
     "python-stdnum>=1.20",   # CURP/RFC/SSN/SIN/EIN/PAN checksums
     "rapidfuzz>=3.6",        # label-anchored KV fuzzy matching
     "dateparser>=1.2",       # locale-aware date parsing
